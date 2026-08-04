@@ -1,0 +1,65 @@
+# Baseline every host in the fleet gets, regardless of role.
+
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: motd
+spec:
+  path: /etc/motd
+  content: |
+    This host is managed by systemcd. Local edits are reverted on the next
+    reconcile — change the manifest instead.
+  mode: "0644"
+  owner: root
+  group: root
+---
+apiVersion: systemcd.dev/v1
+kind: Group
+metadata:
+  name: deploy
+spec:
+  system: true
+---
+apiVersion: systemcd.dev/v1
+kind: User
+metadata:
+  name: deploy
+spec:
+  system: true
+  group: deploy
+  home: /var/lib/deploy
+  shell: /usr/sbin/nologin
+dependsOn:
+  - Group/deploy
+---
+apiVersion: systemcd.dev/v1
+kind: Sysctl
+metadata:
+  name: network-hardening
+spec:
+  values:
+    net.ipv4.conf.all.rp_filter: "1"
+    net.ipv4.conf.all.accept_redirects: "0"
+    net.ipv4.tcp_syncookies: "1"
+---
+# Journald retention, applied as a drop-in and picked up by a reload.
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: journald-limits
+spec:
+  path: /etc/systemd/journald.conf.d/10-systemcd.conf
+  content: |
+    [Journal]
+    SystemMaxUse=500M
+    MaxRetentionSec=1month
+notify:
+  - Service/systemd-journald
+---
+apiVersion: systemcd.dev/v1
+kind: Service
+metadata:
+  name: systemd-journald
+spec:
+  # journald is a static unit: it cannot be enabled, only restarted.
+  state: started

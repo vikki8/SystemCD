@@ -1,0 +1,26 @@
+# Repository-level settings. systemcd reads this from the root of the repo.
+apiVersion: systemcd.dev/v1
+kind: Config
+metadata:
+  name: default
+spec:
+  # Where manifests live. Omit to load the whole repository.
+  paths:
+    - manifests
+
+  # Delete resources that used to be in this repo but are no longer declared.
+  # Off by default: turning it on means removing a file from git removes it
+  # from every host.
+  prune: false
+
+  # Let the agent fix drift instead of only reporting it. This is the
+  # difference between "GitOps" and "a very good linter".
+  selfHeal: true
+
+  # How often the agent reconciles.
+  interval: 5m
+
+  # Labels every node inherits. A node can add its own in
+  # /etc/systemcd/node.yaml, and --label wins over both.
+  labels:
+    env: prod

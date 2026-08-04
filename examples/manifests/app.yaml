@@ -1,0 +1,99 @@
+# A first-party service deployed as a systemd unit: the case Argo CD would
+# handle with a Deployment, expressed for a plain Linux box.
+
+apiVersion: systemcd.dev/v1
+kind: Directory
+metadata:
+  name: billing-state
+  targets:
+    labels:
+      role: web
+spec:
+  path: /var/lib/billing
+  owner: deploy
+  group: deploy
+  mode: "0750"
+dependsOn:
+  - User/deploy
+---
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: billing-env
+  targets:
+    labels:
+      role: web
+spec:
+  path: /etc/billing/billing.env
+  content: |
+    LISTEN_ADDR=127.0.0.1:8080
+    LOG_LEVEL=info
+  mode: "0640"
+  owner: root
+  group: deploy
+  # Keeps the value out of plan output and out of the state file's diff.
+  sensitive: true
+dependsOn:
+  - User/deploy
+notify:
+  - Service/billing
+---
+apiVersion: systemcd.dev/v1
+kind: SystemdUnit
+metadata:
+  name: billing
+  targets:
+    labels:
+      role: web
+spec:
+  unit: billing.service
+  content: |
+    [Unit]
+    Description=Billing API
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=simple
+    User=deploy
+    Group=deploy
+    EnvironmentFile=/etc/billing/billing.env
+    ExecStart=/usr/local/bin/billing serve
+    WorkingDirectory=/var/lib/billing
+    Restart=on-failure
+    RestartSec=5s
+
+    [Install]
+    WantedBy=multi-user.target
+dependsOn:
+  - Directory/billing-state
+notify:
+  - Service/billing
+---
+# One-shot schema migration, guarded so it runs exactly once per version.
+apiVersion: systemcd.dev/v1
+kind: Exec
+metadata:
+  name: billing-migrate
+  targets:
+    labels:
+      role: web
+spec:
+  command: /usr/local/bin/billing migrate --to 2024-11-01
+  creates: /var/lib/billing/.migrated-2024-11-01
+dependsOn:
+  - Directory/billing-state
+---
+apiVersion: systemcd.dev/v1
+kind: Service
+metadata:
+  name: billing
+  targets:
+    labels:
+      role: web
+spec:
+  enabled: true
+  state: started
+dependsOn:
+  - SystemdUnit/billing
+  - Exec/billing-migrate
