@@ -1,0 +1,93 @@
+# A web server role: package, config, service — with the notify wiring that
+# makes a config change reload nginx and nothing else.
+#
+# Only hosts labelled role=web get any of this.
+
+apiVersion: systemcd.dev/v1
+kind: Package
+metadata:
+  name: nginx
+  targets:
+    labels:
+      role: web
+spec:
+  name: nginx
+---
+apiVersion: systemcd.dev/v1
+kind: Directory
+metadata:
+  name: nginx-sites
+  targets:
+    labels:
+      role: web
+spec:
+  path: /etc/nginx/conf.d
+  mode: "0755"
+dependsOn:
+  - Package/nginx
+---
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: nginx-conf
+  targets:
+    labels:
+      role: web
+spec:
+  path: /etc/nginx/nginx.conf
+  # Pulled from files/ in this repo rather than inlined, so it stays
+  # syntax-highlighted and reviewable.
+  source: files/nginx.conf
+  mode: "0644"
+dependsOn:
+  - Package/nginx
+notify:
+  - Service/nginx
+---
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: nginx-site
+  targets:
+    labels:
+      role: web
+spec:
+  path: /etc/nginx/conf.d/app.conf
+  source: files/site.conf
+  mode: "0644"
+dependsOn:
+  - Directory/nginx-sites
+notify:
+  - Service/nginx
+---
+# The distro's default vhost, gone for good.
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: nginx-default-site
+  targets:
+    labels:
+      role: web
+spec:
+  path: /etc/nginx/sites-enabled/default
+  state: absent
+dependsOn:
+  - Package/nginx
+notify:
+  - Service/nginx
+---
+apiVersion: systemcd.dev/v1
+kind: Service
+metadata:
+  name: nginx
+  targets:
+    labels:
+      role: web
+spec:
+  enabled: true
+  state: started
+  # nginx reloads without dropping connections, so prefer that over a
+  # restart when a config file changes.
+  reload: true
+dependsOn:
+  - Package/nginx
