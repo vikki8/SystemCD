@@ -38,6 +38,11 @@ they get a bootstrap script and then years of `ssh` and hope.
 - **Real drift detection.** Someone `vim`s `/etc/nginx/nginx.conf` at 3am;
   the next reconcile reports it as `OutOfSync` and — if self-heal is on — puts
   it back, with the old version saved in the backup directory.
+- **Ownership you can query.** `systemcd owns /etc/nginx/nginx.conf` answers
+  which resource is responsible, whether it was created or adopted, and when
+  it last changed — the question you actually have at 3am.
+- **Drift you can attribute.** "The repo moved ahead" and "someone edited the
+  box" produce identical-looking diffs. systemcd tells them apart.
 - **Prune.** Delete a resource from git and it's removed from the fleet. This
   needs a record of what was last applied, which is exactly what makes it a
   three-way merge rather than a two-way one.
@@ -124,7 +129,7 @@ run just started is not then also restarted.
 |---|---|---|
 | `File` | file contents, mode, ownership | `content` / `source`, `mode`, `owner`, `group`, `state`, `sensitive` |
 | `Directory` | directories | `path`, `mode`, `owner`, `recursive` |
-| `Package` | apt · dnf · yum · zypper · pacman · apk (auto-detected) | `name` / `names`, `version`, `state`, `manager` |
+| `Package` | apt · dnf · yum · zypper · pacman · apk (auto-detected) | `name` / `names`, `version`†, `state`, `manager` |
 | `Service` | systemd runtime state | `enabled`, `state`, `reload`, `scope` |
 | `SystemdUnit` | unit files, with `daemon-reload` | `content` / `source`, `unit`, `directory` |
 | `User` / `Group` | accounts | `uid`/`gid`, `home`, `shell`, `groups`, `system` |
@@ -132,6 +137,35 @@ run just started is not then also restarted.
 | `Exec` | escape hatch, guarded for idempotency | `command` / `argv`, `creates`, `unless`, `onlyIf`, `refreshOnly` |
 
 `systemcd kinds` lists them at runtime.
+
+**† `version` is only accepted where it can be honored.** apt, dnf, yum and
+zypper can install an exact version, downgrade to it, and read the installed
+version back in the same form the manifest wrote. pacman and apk cannot, so
+`spec.version` is *rejected* there rather than silently accepted — a field
+that sometimes converges and sometimes reports permanent drift is worse than
+no field at all. `systemcd capabilities` tells you which host you're on:
+
+```
+$ systemcd capabilities
+package manager:  apk
+version pinning:  not supported
+                  apk pins depend on the version still being present in the
+                  configured repository, the installed version string does
+                  not round-trip with what a manifest writes...
+```
+
+**On `User.groups`:** the shorthand is additive, because "I require docker
+membership" is what people mean, not "I own this account's entire group list".
+Opt into the stronger assertion explicitly:
+
+```yaml
+spec:
+  groups: [docker]              # additive: other memberships are left alone
+  # or
+  groups:
+    ensure: [docker, adm]
+    mode: exact                 # anything else is drift and gets removed
+```
 
 **On `Exec`:** it refuses to build without a guard. Reconciliation only means
 something if a resource can report whether it's already satisfied, so
@@ -149,6 +183,9 @@ something if a resource can report whether it's already satisfied, so
 | `systemcd agent` | the reconcile loop, forever | |
 | `systemcd rollback` | check out the previous applied revision and apply it | |
 | `systemcd validate` | parse and type-check manifests; no host access | `1` on invalid |
+| `systemcd show <ref>` | ownership record for one resource | |
+| `systemcd owns <path>` | which resource owns this path/unit/package/account | |
+| `systemcd capabilities` | what systemcd can guarantee on this host | |
 | `systemcd install` | write and enable systemcd's own unit | |
 
 Every command takes `--json` for machine-readable output, `--only` to narrow
@@ -174,20 +211,124 @@ metadata:
 Labels come from, in increasing precedence: the repo's `Config`,
 `/etc/systemcd/node.yaml` on the machine, and `--label` on the command line.
 
-## How drift and prune actually work
+## Ownership
 
-Every apply records what it applied to `/var/lib/systemcd/state.json`,
-including the manifest that produced each resource. That third copy is what
-makes the difference:
+The thing that determines whether you trust this on a production machine is
+not the controllers — it's whether it can tell you what it owns. Every apply
+writes an ownership record to `/var/lib/systemcd/state.json`.
 
-- **Two-way** (git ⟂ host) tells you a file's contents are wrong.
-- **Three-way** (git ⟂ host ⟂ last-applied) *also* tells you a resource used
-  to be managed and has since been deleted from git — so `--prune` can remove
-  it, in reverse dependency order, by rebuilding it from the stored manifest
-  and asking it to delete itself.
+**Every resource declares what it claims.** A `File` claims `path:/etc/...`,
+a `Service` claims `unit:nginx.service`, a `Package` claims `package:nginx`.
+Two resources claiming the same thing is refused *before* anything is
+observed, let alone applied — last-writer-wins is not a property anyone can
+reason about at 3am:
 
-Prune is opt-in. Removing a line from a YAML file should not silently
-uninstall a package on 400 machines unless you asked for that.
+```
+$ systemcd plan
+systemcd: conflicting ownership:
+  - File/nginx-conf and File/nginx-conf-override both claim
+    path:/etc/nginx/nginx.conf (declared at base.yaml[2] and web.yaml[0])
+```
+
+`Exec` claims nothing, which is the honest description of an escape hatch —
+and the reason it needs a guard.
+
+**Adoption is recorded, not assumed.** A file systemcd created and a file it
+took over from a distro package are different situations, and the second one
+keeps a snapshot of what was there first:
+
+```
+$ systemcd show File/app-conf
+File/app-conf
+  owned by systemcd: yes
+  ownership:         adopted (it already existed when systemcd first managed it)
+  first applied:     2026-08-04 23:40:26 UTC
+  last applied:      2026-08-04 23:44:11 UTC
+  last changed:      2026-08-04 23:40:26 UTC
+  revision:          a1b2c3d…
+  claims:
+    path:/opt/svc/app.conf
+  state before systemcd took it over:
+    checksum:    sha256:ec8b28ac…
+```
+
+**The reverse lookup is the one you need mid-incident:**
+
+```
+$ systemcd owns /etc/nginx/nginx.conf
+path:/etc/nginx/nginx.conf
+  owned by:      File/nginx-conf
+  ownership:     created by systemcd
+  last changed:  2026-08-04 23:40:26 UTC
+  revision:      a1b2c3d…
+```
+
+**Last-applied and last-changed are different questions.** Confirming a
+resource is already correct is not changing it, so `last changed` — and the
+revision attached to it — stay truthful across a hundred no-op reconciles.
+
+### Drift attribution
+
+Because state records the *complete* desired state that was last applied, not
+just the fields that differed, systemcd can answer a question two-way tools
+cannot: **did the repository move, or did someone edit the box?**
+
+```
+$ systemcd plan
+~ File/app-conf                update
+    checksum: sha256:dd6a4f7b… -> sha256:05310cea…
+    changed outside systemcd since 4m ago
+
+1 resource(s) were changed outside systemcd since the last apply:
+  File/app-conf (last applied 4m ago)
+```
+
+The diff looks identical in both cases. Only one of them is an incident. The
+rule: if the host still holds every value systemcd wrote, the manifest is what
+moved (`repo`); if it does not, something else edited the machine
+(`external`). Both are in `--json` as `ownership.driftOrigin`.
+
+### Orphans and prune
+
+A resource systemcd owns that the repository no longer declares does not
+vanish from view. It is reported as `Orphaned`:
+
+```
+RESOURCE          SYNC        HEALTH    OWNED   LAST CHANGED   DETAIL
+File/app-extra    Orphaned    -         yes     3m ago         owned by systemcd but no longer declared…
+```
+
+An orphan is deliberately *not* "out of sync" — the repository isn't asking
+for a change to it — so it doesn't muddy `plan`'s exit code. It's just no
+longer invisible.
+
+`--prune` acts on them, in reverse dependency order, by rebuilding each from
+its stored manifest and asking it to delete itself. Two guard rails:
+
+- **Irreversible prunes need `--confirm`.** Removing a package, deleting an
+  account, or wiping a directory tree is not recoverable from systemcd's
+  backups, so `--prune` alone withholds them and says so. Files are pruned
+  freely because `Delete` backs them up first.
+- **`--only` disables pruning and orphan reporting entirely.** Ownership
+  cannot be judged from a partial view; if prune ran under `--only` it would
+  delete most of the machine.
+
+### State storage
+
+`/var/lib/systemcd/state.json`, mode `0600`, is the trust anchor, so it is
+treated like one:
+
+- **Written atomically with a directory fsync**, so the rename that publishes
+  it survives a power loss — not just the file contents.
+- **The previous copy is rotated to `.bak` first.** A corrupt or truncated
+  state file recovers from the backup with a loud warning rather than either
+  failing the run or silently forgetting every ownership record on the box.
+- **Schema-versioned with forward refusal.** State written by a newer
+  systemcd is refused, not misinterpreted; older state migrates in place.
+- **A `flock` serializes reconciles.** A hand-run `systemcd apply` and the
+  agent converging the same machine at once would interleave writes; the
+  second one is turned away with an explanation. Read-only `plan` and
+  `status` never take the lock, so you can always inspect a busy box.
 
 ## Safety properties
 
@@ -236,12 +377,30 @@ Optional interfaces opt into more: `Refreshable` for `notify` handlers,
 
 ## Status
 
-The reconcile loop, the nine resource kinds, targeting, prune, rollback, and
-the agent all work and are covered by tests (`go test ./...`).
+The reconcile loop, the nine resource kinds, targeting, ownership, drift
+attribution, orphans, prune, rollback, locking and the agent all work and are
+covered by tests (`go test ./...`).
 
-Not there yet: templating in manifests (deliberately deferred — Helm's lesson
-is that string-templated YAML gets ugly fast), secret backends, a fleet-wide
-dashboard, and `Timer`/`Mount`/`Firewall` kinds.
+**Deliberately not doing: string templating.** Every config tool that adds
+`{{ port }}` to a YAML blob eventually reinvents Helm, Jinja or ERB, and then
+nobody knows what the final config on the box actually is. `File.source`
+points at a real file in the repo, so the diff is the diff.
+
+Composition is a different problem and is worth solving properly — the shape
+to aim for is Kustomize-style structured overlays, not interpolation:
+
+```yaml
+spec:
+  source: files/nginx.conf
+  overlays: [hosts/web01/nginx.yaml]   # not implemented yet
+```
+
+The rule to hold onto: **transform structured data, don't interpolate
+strings.**
+
+Also not there yet: secret backends, a fleet-wide view across machines, a
+`release`/disown command for handing a resource back unmanaged, and
+`Timer`/`Mount`/`Firewall` kinds.
 
 ## License
 

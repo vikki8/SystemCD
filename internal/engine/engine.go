@@ -30,6 +30,11 @@ const (
 	ActionRefresh Action = "refresh"
 	ActionSkip    Action = "skipped"
 	ActionError   Action = "error"
+	// ActionOrphan marks a resource systemcd still owns on this host but
+	// that the repository no longer declares. It is reported rather than
+	// silently ignored, because an unowned-but-still-managed resource is
+	// exactly the state operators lose track of.
+	ActionOrphan Action = "orphaned"
 )
 
 // Changed reports whether the action represents a modification to the host.
@@ -39,6 +44,25 @@ func (a Action) Changed() bool {
 		return true
 	}
 	return false
+}
+
+// Ownership is what systemcd knows about its claim over a resource.
+type Ownership struct {
+	// Owned reports whether systemcd has a recorded claim on this resource.
+	Owned bool
+	// Adopted means the resource already existed when systemcd first took
+	// ownership; systemcd did not create it.
+	Adopted bool
+	// Claims are the physical things the resource owns, as "kind:key".
+	Claims []string
+	// Origin says whether drift came from the repository or from outside.
+	Origin state.Origin
+
+	FirstAppliedAt time.Time
+	LastAppliedAt  time.Time
+	LastChangedAt  time.Time
+	// Revision is the git revision in effect at the last change.
+	Revision string
 }
 
 // Result is the outcome for one resource.
@@ -55,11 +79,29 @@ type Result struct {
 	Duration     time.Duration
 	// Source is the manifest location, for error reporting.
 	Source string
+	// Owner carries the ownership record for this resource.
+	Owner Ownership
+	// needsConfirm marks a destructive prune withheld pending --confirm.
+	needsConfirm bool
+
+	// desired is the full desired state, recorded on a successful apply so a
+	// later run can tell external drift from a repository change.
+	desired resource.State
+	// observed is what the host looked like before this run changed anything.
+	observed resource.State
 }
 
 // OutOfSync reports whether the resource differed from the manifest.
+//
+// An orphan is deliberately not out of sync: the repository is not asking for
+// any change to it. It shows up in reports as its own category, and only
+// becomes an actionable difference once pruning is enabled.
 func (r Result) OutOfSync() bool {
-	return r.Action != ActionNoop && r.Action != ActionSkip
+	switch r.Action {
+	case ActionNoop, ActionSkip, ActionOrphan:
+		return false
+	}
+	return true
 }
 
 // Report is the outcome of a whole reconcile.
@@ -69,6 +111,8 @@ type Report struct {
 	Results  []Result
 	Started  time.Time
 	Finished time.Time
+	// Notes are run-level messages that belong to no single resource.
+	Notes []string
 }
 
 // Counts summarizes a report.
@@ -79,6 +123,12 @@ type Counts struct {
 	Failed   int
 	Skipped  int
 	Degraded int
+	Orphaned int
+	// ExternalDrift counts resources changed outside systemcd since the last
+	// apply, as opposed to resources the repository moved ahead of.
+	ExternalDrift int
+	// NeedsConfirm counts destructive prunes withheld pending --confirm.
+	NeedsConfirm int
 }
 
 // Counts tallies the report.
@@ -89,6 +139,8 @@ func (r *Report) Counts() Counts {
 		switch {
 		case res.Err != nil:
 			c.Failed++
+		case res.Action == ActionOrphan:
+			c.Orphaned++
 		case res.Action == ActionSkip:
 			c.Skipped++
 		case res.Action == ActionNoop:
@@ -99,8 +151,39 @@ func (r *Report) Counts() Counts {
 		if res.Health == resource.HealthDegraded {
 			c.Degraded++
 		}
+		if res.Owner.Origin == state.OriginExternal {
+			c.ExternalDrift++
+		}
+		if res.needsConfirm {
+			c.NeedsConfirm++
+		}
 	}
 	return c
+}
+
+// ExternalDrift lists resources that were changed outside systemcd since the
+// last apply. These are the ones worth paging someone about: the repository
+// did not ask for them to change.
+func (r *Report) ExternalDrift() []Result {
+	var out []Result
+	for _, res := range r.Results {
+		if res.Owner.Origin == state.OriginExternal {
+			out = append(out, res)
+		}
+	}
+	return out
+}
+
+// Orphans lists resources systemcd owns that the repository no longer
+// declares.
+func (r *Report) Orphans() []Result {
+	var out []Result
+	for _, res := range r.Results {
+		if res.Action == ActionOrphan {
+			out = append(out, res)
+		}
+	}
+	return out
 }
 
 // OutOfSync reports whether anything differed from the desired state.
@@ -158,6 +241,9 @@ type Options struct {
 	Logf func(format string, args ...any)
 	// HealthChecks runs post-apply health verification.
 	HealthChecks bool
+	// ConfirmDestructive permits pruning resources whose deletion systemcd
+	// cannot undo (packages, accounts, recursive directory removal).
+	ConfirmDestructive bool
 }
 
 // Reconcile plans, and unless DryRun is set, applies the repository.
@@ -213,12 +299,13 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 			report.Results = append(report.Results, Result{
 				ID: n.id, Action: ActionSkip, Source: n.doc.Location(),
 				Messages: []string{reason},
+				Owner:    ownershipOf(snap, n.id),
 			})
 			blockDependents(g, preds, n.id, blocked, fmt.Sprintf("depends on skipped %s", n.id))
 			continue
 		}
 
-		res := rc.reconcileOne(n, notified[n.id])
+		res := rc.reconcileOne(n, notified[n.id], snap)
 		report.Results = append(report.Results, res)
 
 		if res.Err != nil {
@@ -238,9 +325,14 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 		}
 	}
 
-	if opts.Prune {
-		pruned := rc.prune(g, snap)
-		report.Results = append(report.Results, pruned...)
+	// Ownership bookkeeping only makes sense over a complete view of the
+	// repository. With --only, the unselected resources are absent by
+	// request, not orphaned, so neither orphan reporting nor pruning may run.
+	if len(opts.Only) == 0 {
+		report.Results = append(report.Results, rc.reconcileOwnedButUndeclared(g, snap)...)
+	} else if opts.Prune {
+		report.Notes = append(report.Notes,
+			"pruning was skipped because --only narrows the run; ownership cannot be judged from a partial view")
 	}
 
 	if opts.HealthChecks {
@@ -264,9 +356,31 @@ type Context struct {
 	opts     Options
 }
 
-func (rc *Context) reconcileOne(n *node, wasNotified bool) Result {
+// ownershipOf reads what state knows about a resource, without any host
+// observation.
+func ownershipOf(snap *state.Snapshot, id resource.ID) Ownership {
+	rec, ok := snap.Resources[id.String()]
+	if !ok {
+		return Ownership{Origin: state.OriginNew}
+	}
+	return Ownership{
+		Owned:          true,
+		Adopted:        rec.Adopted,
+		Claims:         rec.Claims,
+		FirstAppliedAt: rec.FirstAppliedAt,
+		LastAppliedAt:  rec.LastAppliedAt,
+		LastChangedAt:  rec.LastChangedAt,
+		Revision:       rec.Revision,
+	}
+}
+
+func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot) Result {
 	start := time.Now()
-	out := Result{ID: n.id, Action: ActionNoop, Source: n.doc.Location(), Notified: wasNotified}
+	out := Result{
+		ID: n.id, Action: ActionNoop, Source: n.doc.Location(), Notified: wasNotified,
+		Owner: ownershipOf(snap, n.id),
+	}
+	out.Owner.Claims = resource.ClaimStrings(resource.ClaimsOf(n.res))
 
 	var messages []string
 	rc.resource.Logf = func(format string, args ...any) {
@@ -298,6 +412,14 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool) Result {
 	diff := resource.Compare(desired, observed, sensitive)
 	out.Diff = diff
 	out.Action = classify(diff)
+	out.desired, out.observed = desired, observed
+
+	// Attribute the drift. If the host still holds every value systemcd last
+	// wrote, the repository is what moved; if it does not, something outside
+	// systemcd edited the machine. Only the second one is an incident.
+	if rec, owned := snap.Resources[n.id.String()]; owned && !diff.Empty() {
+		out.Owner.Origin = rec.OriginOf(observed, fieldsOf(diff))
+	}
 
 	if diff.Empty() && !wasNotified {
 		return out
@@ -393,9 +515,11 @@ func blockDependents(g *graph, preds map[resource.ID]map[resource.ID]bool, faile
 	}
 }
 
-// prune deletes resources recorded in state that the repository no longer
-// declares. Deletions run in reverse dependency order.
-func (rc *Context) prune(g *graph, snap *state.Snapshot) []Result {
+// reconcileOwnedButUndeclared handles resources systemcd owns that the
+// repository no longer declares. With pruning on they are deleted, in reverse
+// dependency order; with pruning off they are reported as orphans rather than
+// vanishing from the operator's view.
+func (rc *Context) reconcileOwnedButUndeclared(g *graph, snap *state.Snapshot) []Result {
 	var stale []*manifest.Document
 	for _, ref := range snap.Refs() {
 		rec := snap.Resources[ref]
@@ -405,29 +529,46 @@ func (rc *Context) prune(g *graph, snap *state.Snapshot) []Result {
 		}
 		docs, err := manifest.Parse([]byte(rec.Manifest), "state:"+ref)
 		if err != nil || len(docs) == 0 {
+			// The stored manifest is unusable, so the resource can neither be
+			// rebuilt nor deleted. Say so instead of dropping it silently.
+			stale = append(stale, nil)
 			continue
 		}
 		stale = append(stale, docs[0])
 	}
-	if len(stale) == 0 {
-		return nil
-	}
 
-	staleGraph, err := build(stale)
-	if err != nil {
-		// Stale manifests may reference resources that no longer exist;
-		// fall back to plain reverse-alphabetical order.
-		return rc.pruneUnordered(stale, snap)
-	}
-
+	var docs []*manifest.Document
 	var out []Result
-	for i := len(staleGraph.sorted) - 1; i >= 0; i-- {
-		out = append(out, rc.pruneOne(staleGraph.sorted[i].res, staleGraph.sorted[i].id, snap))
+	for i, doc := range stale {
+		if doc == nil {
+			ref := snap.Refs()[i]
+			out = append(out, Result{
+				ID: idFromRef(ref), Action: ActionSkip, Source: "state",
+				Messages: []string{"state holds an unparsable manifest for this resource; it cannot be pruned automatically"},
+				Owner:    ownershipOf(snap, idFromRef(ref)),
+			})
+			continue
+		}
+		docs = append(docs, doc)
+	}
+	if len(docs) == 0 {
+		return out
+	}
+
+	ordered, err := build(docs)
+	if err != nil {
+		// Stale manifests can reference resources that no longer exist;
+		// fall back to reverse-alphabetical order.
+		return append(out, rc.handleStaleUnordered(docs, snap)...)
+	}
+	for i := len(ordered.sorted) - 1; i >= 0; i-- {
+		n := ordered.sorted[i]
+		out = append(out, rc.handleStale(n.res, n.id, snap))
 	}
 	return out
 }
 
-func (rc *Context) pruneUnordered(stale []*manifest.Document, snap *state.Snapshot) []Result {
+func (rc *Context) handleStaleUnordered(stale []*manifest.Document, snap *state.Snapshot) []Result {
 	sort.Slice(stale, func(i, j int) bool { return stale[i].Ref() > stale[j].Ref() })
 	var out []Result
 	for _, doc := range stale {
@@ -436,14 +577,20 @@ func (rc *Context) pruneUnordered(stale []*manifest.Document, snap *state.Snapsh
 			out = append(out, Result{ID: resource.ID{Kind: doc.Kind, Name: doc.Metadata.Name}, Action: ActionError, Err: err})
 			continue
 		}
-		out = append(out, rc.pruneOne(res, res.ID(), snap))
+		out = append(out, rc.handleStale(res, res.ID(), snap))
 	}
 	return out
 }
 
-func (rc *Context) pruneOne(res resource.Resource, id resource.ID, snap *state.Snapshot) Result {
+func (rc *Context) handleStale(res resource.Resource, id resource.ID, snap *state.Snapshot) Result {
 	start := time.Now()
-	out := Result{ID: id, Action: ActionPrune, Source: "state"}
+	out := Result{ID: id, Action: ActionOrphan, Source: "state", Owner: ownershipOf(snap, id)}
+	defer func() { out.Duration = time.Since(start) }()
+
+	if !rc.opts.Prune {
+		out.Messages = []string{"owned by systemcd but no longer declared in the repository; run with --prune to remove it"}
+		return out
+	}
 
 	del, ok := res.(resource.Deletable)
 	if !ok {
@@ -451,10 +598,20 @@ func (rc *Context) pruneOne(res resource.Resource, id resource.ID, snap *state.S
 		out.Messages = []string{"kind does not support pruning; remove it manually"}
 		return out
 	}
+
+	// Deleting a package or an account is not something systemcd can undo,
+	// so it needs a second, explicit signal beyond "--prune".
+	if resource.IsDestructive(res) && !rc.opts.ConfirmDestructive {
+		out.Action = ActionSkip
+		out.needsConfirm = true
+		out.Messages = []string{fmt.Sprintf("pruning %s would be irreversible; re-run with --confirm to allow it", id)}
+		return out
+	}
+
+	out.Action = ActionPrune
 	out.Diff = resource.Diff{{Field: "state", Have: resource.Present, Want: resource.Absent}}
 
 	if rc.opts.DryRun {
-		out.Duration = time.Since(start)
 		return out
 	}
 
@@ -468,7 +625,22 @@ func (rc *Context) pruneOne(res resource.Resource, id resource.ID, snap *state.S
 		delete(snap.Resources, id.String())
 	}
 	out.Messages = messages
-	out.Duration = time.Since(start)
+	return out
+}
+
+func idFromRef(ref string) resource.ID {
+	id, err := resource.ParseID(ref)
+	if err != nil {
+		return resource.ID{Kind: "Unknown", Name: ref}
+	}
+	return id
+}
+
+func fieldsOf(d resource.Diff) []string {
+	out := make([]string, 0, len(d))
+	for _, f := range d {
+		out = append(out, f.Field)
+	}
 	return out
 }
 
@@ -501,27 +673,61 @@ func (rc *Context) checkHealth(g *graph, report *Report, changed map[resource.ID
 	}
 }
 
-// recordState stores what was applied so a later run can detect removal.
+// recordState stores systemcd's ownership claim and the complete desired
+// state it just applied.
+//
+// Recording the *whole* desired state, not just the fields that changed, is
+// what lets the next run tell an external edit from a repository change: the
+// question "does the host still hold what we wrote?" needs everything we
+// wrote, not the subset that happened to differ last time.
 func recordState(snap *state.Snapshot, n *node, res Result, revision string) {
 	raw, err := yaml.Marshal(n.doc)
 	if err != nil {
 		return
 	}
-	desired := map[string]string{}
-	for _, f := range res.Diff {
-		desired[f.Field] = f.Want
+	now := time.Now().UTC()
+	ref := n.id.String()
+	prev, existed := snap.Resources[ref]
+
+	rec := state.Record{
+		Kind:     n.id.Kind,
+		Name:     n.id.Name,
+		Manifest: string(raw),
+		Claims:   resource.ClaimStrings(resource.ClaimsOf(n.res)),
+		Applied:  map[string]string(res.desired),
+		Revision: revision,
 	}
-	if prev, ok := snap.Resources[n.id.String()]; ok && len(res.Diff) == 0 {
-		desired = prev.Desired
+
+	switch {
+	case existed:
+		rec.FirstAppliedAt = prev.FirstAppliedAt
+		rec.Adopted = prev.Adopted
+		rec.PriorState = prev.PriorState
+		rec.LastChangedAt = prev.LastChangedAt
+		if prev.Revision != "" && !res.Action.Changed() {
+			// An unchanged resource keeps the revision that last moved it,
+			// so "last changed at commit X" stays truthful.
+			rec.Revision = prev.Revision
+		}
+	default:
+		rec.FirstAppliedAt = now
+		// Anything that was not created by this run already existed, which
+		// means systemcd adopted it rather than owning it from birth. That
+		// distinction matters when deciding whether pruning is safe.
+		rec.Adopted = res.Action != ActionCreate
+		if rec.Adopted {
+			rec.PriorState = map[string]string(res.observed)
+		}
 	}
-	snap.Resources[n.id.String()] = state.Record{
-		Kind:      n.id.Kind,
-		Name:      n.id.Name,
-		Manifest:  string(raw),
-		Desired:   desired,
-		AppliedAt: time.Now().UTC(),
-		Revision:  revision,
+
+	rec.LastAppliedAt = now
+	if res.Action.Changed() {
+		rec.LastChangedAt = now
 	}
+	if rec.Applied == nil && existed {
+		rec.Applied = prev.Applied
+	}
+	snap.Resources[ref] = rec
 }
 
 // filterDocs applies --only selectors. A selector is a bare kind ("Service"),

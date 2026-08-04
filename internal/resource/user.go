@@ -20,9 +20,9 @@ type UserSpec struct {
 	UID   *int   `yaml:"uid,omitempty"`
 	Home  string `yaml:"home,omitempty"`
 	Shell string `yaml:"shell,omitempty"`
-	// Groups are supplementary groups the user must belong to. Groups the
-	// user has but that are not listed here are left alone.
-	Groups []string `yaml:"groups,omitempty"`
+	// Groups declares supplementary group membership. See GroupMembership for
+	// the two forms and what each one asserts.
+	Groups GroupMembership `yaml:"groups,omitempty"`
 	// Group is the primary group.
 	Group string `yaml:"group,omitempty"`
 	// System creates a system account (no aging, low uid).
@@ -66,7 +66,7 @@ func (u *User) Validate() error {
 	if u.spec.Shell != "" && !strings.HasPrefix(u.spec.Shell, "/") {
 		return fmt.Errorf("spec.shell %q must be an absolute path", u.spec.Shell)
 	}
-	return nil
+	return u.spec.Groups.normalize()
 }
 
 func (u *User) Desired(c *Context) (State, error) {
@@ -83,8 +83,9 @@ func (u *User) Desired(c *Context) (State, error) {
 	if u.spec.Shell != "" {
 		s["shell"] = u.spec.Shell
 	}
-	if len(u.spec.Groups) > 0 {
-		s["groups"] = normalizeList(u.spec.Groups)
+	if !u.spec.Groups.Empty() {
+		s["groups"] = normalizeList(u.spec.Groups.Ensure)
+		s["_groupsMode"] = u.spec.Groups.Mode
 	}
 	return s, nil
 }
@@ -107,28 +108,63 @@ func (u *User) Observe(c *Context) (State, error) {
 		s["_gid"] = fields[3]
 	}
 
-	if len(u.spec.Groups) > 0 {
-		res, err := c.Host.Run(c.Ctx, "id", "-nG", u.user)
+	if !u.spec.Groups.Empty() {
+		groups, err := u.observeGroups(c, s["_gid"])
 		if err != nil {
 			return nil, err
 		}
-		if res.OK() {
-			have := map[string]bool{}
-			for _, g := range strings.Fields(res.Stdout) {
-				have[g] = true
-			}
-			// Report only the membership the manifest asked about, so an
-			// unrelated group does not read as drift.
-			var present []string
-			for _, g := range u.spec.Groups {
-				if have[g] {
-					present = append(present, g)
-				}
-			}
-			s["groups"] = normalizeList(present)
-		}
+		s["groups"] = groups
+		s["_groupsMode"] = u.spec.Groups.Mode
 	}
 	return s, nil
+}
+
+// observeGroups renders the account's supplementary membership in whatever
+// terms the manifest asked the question.
+//
+// In additive mode only the named groups are reported, so an unrelated group
+// the account picked up elsewhere is not drift. In exact mode the full list
+// is reported (minus the primary group, which `id -nG` includes but
+// `usermod --groups` does not manage), so extra membership *is* drift.
+func (u *User) observeGroups(c *Context, primaryGID string) (string, error) {
+	res, err := c.Host.Run(c.Ctx, "id", "-nG", u.user)
+	if err != nil {
+		return "", err
+	}
+	if !res.OK() {
+		return "", nil
+	}
+	have := strings.Fields(res.Stdout)
+
+	if u.spec.Groups.Mode == MembershipAdditive {
+		present := make([]string, 0, len(u.spec.Groups.Ensure))
+		set := map[string]bool{}
+		for _, g := range have {
+			set[g] = true
+		}
+		for _, g := range u.spec.Groups.Ensure {
+			if set[g] {
+				present = append(present, g)
+			}
+		}
+		return normalizeList(present), nil
+	}
+
+	primary := ""
+	if primaryGID != "" {
+		if entry, found, err := getent(c, "group", primaryGID); err == nil && found {
+			if fields := strings.Split(entry, ":"); len(fields) > 0 {
+				primary = fields[0]
+			}
+		}
+	}
+	supplementary := make([]string, 0, len(have))
+	for _, g := range have {
+		if g != primary {
+			supplementary = append(supplementary, g)
+		}
+	}
+	return normalizeList(supplementary), nil
 }
 
 func (u *User) Apply(c *Context, d Diff) error {
@@ -153,8 +189,8 @@ func (u *User) Apply(c *Context, d Diff) error {
 		if u.spec.Shell != "" {
 			args = append(args, "--shell", u.spec.Shell)
 		}
-		if len(u.spec.Groups) > 0 {
-			args = append(args, "--groups", strings.Join(u.spec.Groups, ","))
+		if !u.spec.Groups.Empty() {
+			args = append(args, "--groups", strings.Join(u.spec.Groups.Ensure, ","))
 		}
 		if u.createHome() {
 			args = append(args, "--create-home")
@@ -179,9 +215,12 @@ func (u *User) Apply(c *Context, d Diff) error {
 	if d.Has("shell") && u.spec.Shell != "" {
 		mod = append(mod, "--shell", u.spec.Shell)
 	}
-	if d.Has("groups") && len(u.spec.Groups) > 0 {
-		// --append keeps memberships the manifest does not mention.
-		mod = append(mod, "--append", "--groups", strings.Join(u.spec.Groups, ","))
+	if d.Has("groups") && !u.spec.Groups.Empty() {
+		if u.spec.Groups.Mode == MembershipAdditive {
+			// --append keeps memberships the manifest does not mention.
+			mod = append(mod, "--append")
+		}
+		mod = append(mod, "--groups", strings.Join(u.spec.Groups.Ensure, ","))
 	}
 	if len(mod) == 0 {
 		return nil

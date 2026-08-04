@@ -29,6 +29,10 @@ spec:
   group: deploy
   home: /var/lib/deploy
   shell: /usr/sbin/nologin
+  # Additive: this account must be in `deploy`, but memberships added by a
+  # package post-install elsewhere are left alone. Use the explicit form
+  # (`ensure:` + `mode: exact`) when you really do own the whole list.
+  groups: [deploy]
 dependsOn:
   - Group/deploy
 ---

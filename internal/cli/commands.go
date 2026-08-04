@@ -11,7 +11,6 @@ import (
 	"github.com/vikki8/systemcd/internal/manifest"
 	"github.com/vikki8/systemcd/internal/paths"
 	"github.com/vikki8/systemcd/internal/report"
-	"github.com/vikki8/systemcd/internal/state"
 )
 
 func newFlagSet(app *App, name, usage string) *flag.FlagSet {
@@ -48,7 +47,7 @@ func runPlan(app *App, args []string) int {
 		Prune:    resolvePrune(repo.Config, &f),
 		Revision: app.revision(ctx, repo.Root),
 		Only:     f.only,
-		Store:    state.New(app.Host),
+		Store:    app.storeFor(),
 	})
 	if err != nil {
 		return app.errf("%v", err)
@@ -73,11 +72,13 @@ func runApply(app *App, args []string) int {
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	rep, err := app.apply(ctx, repo, node, &f, app.revision(ctx, repo.Root))
-	if err != nil {
-		return app.errf("%v", err)
-	}
-	return app.emit(rep, &f, false)
+	return app.withLock(func() int {
+		rep, err := app.apply(ctx, repo, node, &f, app.revision(ctx, repo.Root))
+		if err != nil {
+			return app.errf("%v", err)
+		}
+		return app.emit(rep, &f, false)
+	})
 }
 
 func runStatus(app *App, args []string) int {
@@ -102,7 +103,7 @@ func runStatus(app *App, args []string) int {
 		Node:   node,
 		DryRun: true,
 		Only:   f.only,
-		Store:  state.New(app.Host),
+		Store:  app.storeFor(),
 	})
 	if err != nil {
 		return app.errf("%v", err)
@@ -174,11 +175,13 @@ func runSync(app *App, args []string) int {
 	if err != nil {
 		return app.errf("%v", err)
 	}
-	rep, err := app.apply(ctx, repo, node, &f, rev)
-	if err != nil {
-		return app.errf("%v", err)
-	}
-	return app.emit(rep, &f, false)
+	return app.withLock(func() int {
+		rep, err := app.apply(ctx, repo, node, &f, rev)
+		if err != nil {
+			return app.errf("%v", err)
+		}
+		return app.emit(rep, &f, false)
+	})
 }
 
 func runAgent(app *App, args []string) int {
@@ -234,19 +237,31 @@ func runAgent(app *App, args []string) int {
 		}
 
 		dryRun := !*selfHeal && !repo.Config.SelfHeal
-		rep, err := engine.Reconcile(ctx, engine.Options{
-			Repo:         repo,
-			Host:         app.Host,
-			Node:         node,
-			DryRun:       dryRun,
-			Prune:        resolvePrune(repo.Config, &f),
-			Revision:     rev,
-			Only:         f.only,
-			Store:        state.New(app.Host),
-			HealthChecks: f.health,
+		opts := engine.Options{
+			Repo:               repo,
+			Host:               app.Host,
+			Node:               node,
+			DryRun:             dryRun,
+			Prune:              resolvePrune(repo.Config, &f),
+			Revision:           rev,
+			Only:               f.only,
+			Store:              app.storeFor(),
+			HealthChecks:       f.health,
+			ConfirmDestructive: f.confirm,
+		}
+
+		// The lock is taken per iteration rather than for the agent's
+		// lifetime, so an operator can still run `systemcd apply` by hand
+		// between passes instead of being locked out by the daemon.
+		var rep *engine.Report
+		lockErr := app.lockedRun(dryRun, func() error {
+			var err error
+			rep, err = engine.Reconcile(ctx, opts)
+			return err
 		})
-		if err != nil {
-			fmt.Fprintf(app.Stderr, "systemcd: reconcile failed: %v\n", err)
+		if lockErr != nil {
+			fmt.Fprintf(app.Stderr, "systemcd: reconcile failed: %v\n", lockErr)
+			err = lockErr
 		} else {
 			app.logIteration(rep, &f)
 		}
@@ -278,7 +293,7 @@ func runRollback(app *App, args []string) int {
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	store := state.New(app.Host)
+	store := app.storeFor()
 	snap, err := store.Load()
 	if err != nil {
 		return app.errf("%v", err)
@@ -305,11 +320,13 @@ func runRollback(app *App, args []string) int {
 	if err != nil {
 		return app.errf("%v", err)
 	}
-	rep, err := app.apply(ctx, repo, node, &f, target)
-	if err != nil {
-		return app.errf("%v", err)
-	}
-	return app.emit(rep, &f, false)
+	return app.withLock(func() int {
+		rep, err := app.apply(ctx, repo, node, &f, target)
+		if err != nil {
+			return app.errf("%v", err)
+		}
+		return app.emit(rep, &f, false)
+	})
 }
 
 // apply runs a real reconcile with health checks enabled.
@@ -319,16 +336,17 @@ func (app *App) apply(ctx context.Context, repo *manifest.Repository, node manif
 		logf = func(format string, args ...any) { fmt.Fprintf(app.Stderr, format+"\n", args...) }
 	}
 	return engine.Reconcile(ctx, engine.Options{
-		Repo:         repo,
-		Host:         app.Host,
-		Node:         node,
-		DryRun:       false,
-		Prune:        resolvePrune(repo.Config, f),
-		Revision:     revision,
-		Only:         f.only,
-		Store:        state.New(app.Host),
-		Logf:         logf,
-		HealthChecks: f.health,
+		Repo:               repo,
+		Host:               app.Host,
+		Node:               node,
+		DryRun:             false,
+		Prune:              resolvePrune(repo.Config, f),
+		Revision:           revision,
+		Only:               f.only,
+		Store:              app.storeFor(),
+		Logf:               logf,
+		HealthChecks:       f.health,
+		ConfirmDestructive: f.confirm,
 	})
 }
 

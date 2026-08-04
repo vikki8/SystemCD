@@ -63,6 +63,10 @@ func build(docs []*manifest.Document) (*graph, error) {
 		g.nodes[id] = n
 	}
 
+	if err := g.checkClaims(); err != nil {
+		return nil, err
+	}
+
 	// Edges pointing outside the working set are dropped rather than
 	// rejected: host targeting and --only legitimately narrow the set, and a
 	// reference that is unresolvable across the *whole* repository is caught
@@ -78,6 +82,47 @@ func build(docs []*manifest.Document) (*graph, error) {
 	}
 	g.sorted = sorted
 	return g, nil
+}
+
+// checkClaims refuses a repository in which two resources would take
+// ownership of the same thing.
+//
+// This is caught before anything is observed, let alone applied: two File
+// resources pointing at one path do not "mostly work", they produce a machine
+// whose contents depend on document order, and last-writer-wins is not a
+// property anyone can reason about at 3am.
+func (g *graph) checkClaims() error {
+	type holder struct {
+		id  resource.ID
+		loc string
+	}
+	owners := map[string]holder{}
+
+	// Sort for a deterministic error message regardless of map iteration.
+	ids := make([]resource.ID, 0, len(g.nodes))
+	for id := range g.nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return g.nodes[ids[i]].order < g.nodes[ids[j]].order })
+
+	var conflicts []string
+	for _, id := range ids {
+		n := g.nodes[id]
+		for _, claim := range resource.ClaimsOf(n.res) {
+			key := claim.String()
+			if prev, taken := owners[key]; taken {
+				conflicts = append(conflicts, fmt.Sprintf(
+					"%s and %s both claim %s (declared at %s and %s)",
+					prev.id, id, key, prev.loc, n.doc.Location()))
+				continue
+			}
+			owners[key] = holder{id: id, loc: n.doc.Location()}
+		}
+	}
+	if len(conflicts) > 0 {
+		return fmt.Errorf("conflicting ownership:\n  - %s", strings.Join(conflicts, "\n  - "))
+	}
+	return nil
 }
 
 // resolvable keeps only the references present in this graph.

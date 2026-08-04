@@ -151,6 +151,21 @@ type Deletable interface {
 	Delete(c *Context) error
 }
 
+// Destructive is implemented by kinds whose deletion is not recoverable from
+// systemcd's own backups — removing a package, deleting an account, wiping a
+// directory tree. Pruning one of these requires explicit confirmation, since
+// "I deleted a line of YAML" should never silently mean "uninstall the
+// database on 400 machines".
+type Destructive interface {
+	DestructiveDelete() bool
+}
+
+// IsDestructive reports whether pruning a resource needs confirmation.
+func IsDestructive(r Resource) bool {
+	d, ok := r.(Destructive)
+	return ok && d.DestructiveDelete()
+}
+
 // HealthStatus is the post-apply verdict for a resource.
 type HealthStatus string
 

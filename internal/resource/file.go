@@ -182,6 +182,13 @@ func (f *File) Apply(c *Context, d Diff) error {
 }
 
 func (f *File) Delete(c *Context) error {
+	// Back up before removing, not just before overwriting: a delete is the
+	// one operation with nothing left to recover from afterwards.
+	if f.backupEnabled() {
+		if err := backupExisting(c, f.spec.Path); err != nil {
+			return err
+		}
+	}
 	err := c.Host.Remove(f.spec.Path)
 	if errors.Is(err, host.ErrNotExist) {
 		return nil

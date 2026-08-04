@@ -13,8 +13,12 @@ const ConfigDir = "/etc/systemcd"
 // three-way reconciliation (and therefore pruning) possible.
 var StateFile = path.Join(DataDir, "state.json")
 
-// BackupDir holds copies of files replaced by a File resource.
+// BackupDir holds copies of files replaced or removed by a File resource.
 var BackupDir = path.Join(DataDir, "backups")
+
+// LockFile serializes reconciles so an operator running `systemcd apply` by
+// hand cannot interleave with the agent's loop.
+var LockFile = path.Join(DataDir, "lock")
 
 // RepoDir is where `sync` and `agent` clone the desired-state repository.
 var RepoDir = path.Join(DataDir, "repo")

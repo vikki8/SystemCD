@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -85,7 +86,49 @@ func (h *OSHost) LookPath(name string) (string, error) { return exec.LookPath(na
 
 func (h *OSHost) ReadFile(path string) ([]byte, error) { return os.ReadFile(h.resolve(path)) }
 
+// TryLock takes a non-blocking exclusive flock. The lock file is created if
+// needed and deliberately never removed: unlinking it races with another
+// process that has already opened it.
+func (h *OSHost) TryLock(path string) (func() error, error) {
+	real := h.resolve(path)
+	if err := os.MkdirAll(filepath.Dir(real), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(real, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, ErrLocked
+		}
+		return nil, err
+	}
+	// Record who holds it, so an operator staring at a "locked" message can
+	// find the process.
+	_ = f.Truncate(0)
+	if _, err := f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
+		// Losing the annotation is not worth failing the run over.
+		_ = err
+	}
+	return func() error {
+		defer f.Close()
+		return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	}, nil
+}
+
 func (h *OSHost) WriteFile(path string, data []byte, mode fs.FileMode) error {
+	return h.writeFile(path, data, mode, false)
+}
+
+// WriteFileSync additionally fsyncs the parent directory so the rename is
+// durable, not just the file contents.
+func (h *OSHost) WriteFileSync(path string, data []byte, mode fs.FileMode) error {
+	return h.writeFile(path, data, mode, true)
+}
+
+func (h *OSHost) writeFile(path string, data []byte, mode fs.FileMode, syncDir bool) error {
 	real := h.resolve(path)
 	if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
 		return err
@@ -113,7 +156,18 @@ func (h *OSHost) WriteFile(path string, data []byte, mode fs.FileMode) error {
 	if err := os.Chmod(tmpName, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, real)
+	if err := os.Rename(tmpName, real); err != nil {
+		return err
+	}
+	if !syncDir {
+		return nil
+	}
+	dir, err := os.Open(filepath.Dir(real))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func (h *OSHost) Stat(path string) (FileInfo, error) {
