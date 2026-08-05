@@ -81,6 +81,12 @@ type Result struct {
 	Source string
 	// Owner carries the ownership record for this resource.
 	Owner Ownership
+	// ContentBefore and ContentAfter carry the text bodies behind a checksum
+	// change, so a plan can show what actually differs rather than two
+	// hashes. Empty when the kind has no text body or it is sensitive.
+	ContentBefore string
+	ContentAfter  string
+	HasContent    bool
 	// needsConfirm marks a destructive prune withheld pending --confirm.
 	needsConfirm bool
 
@@ -89,6 +95,8 @@ type Result struct {
 	desired resource.State
 	// observed is what the host looked like before this run changed anything.
 	observed resource.State
+	// baselinePath points at contents preserved on first adoption.
+	baselinePath string
 }
 
 // OutOfSync reports whether the resource differed from the manifest.
@@ -108,9 +116,12 @@ func (r Result) OutOfSync() bool {
 type Report struct {
 	Revision string
 	DryRun   bool
-	Results  []Result
-	Started  time.Time
-	Finished time.Time
+	// Operation names what produced this report ("apply", "adopt",
+	// "release"), so output does not claim to be something it is not.
+	Operation string
+	Results   []Result
+	Started   time.Time
+	Finished  time.Time
 	// Notes are run-level messages that belong to no single resource.
 	Notes []string
 }
@@ -124,6 +135,8 @@ type Counts struct {
 	Skipped  int
 	Degraded int
 	Orphaned int
+	Adopted  int
+	Released int
 	// ExternalDrift counts resources changed outside systemcd since the last
 	// apply, as opposed to resources the repository moved ahead of.
 	ExternalDrift int
@@ -141,6 +154,10 @@ func (r *Report) Counts() Counts {
 			c.Failed++
 		case res.Action == ActionOrphan:
 			c.Orphaned++
+		case res.Action == ActionAdopt:
+			c.Adopted++
+		case res.Action == ActionRelease, res.Action == ActionRestore:
+			c.Released++
 		case res.Action == ActionSkip:
 			c.Skipped++
 		case res.Action == ActionNoop:
@@ -255,8 +272,11 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 		return nil, errors.New("engine: no host provided")
 	}
 
-	docs := opts.Repo.SelectFor(opts.Node)
-	docs, err := filterDocs(docs, opts.Only)
+	docs, err := opts.Repo.SelectForE(opts.Node)
+	if err != nil {
+		return nil, err
+	}
+	docs, err = filterDocs(docs, opts.Only)
 	if err != nil {
 		return nil, err
 	}
@@ -414,6 +434,17 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 	out.Action = classify(diff)
 	out.desired, out.observed = desired, observed
 
+	// A checksum change is not reviewable. Capture the text so the report can
+	// show the lines that differ.
+	if diff.Has("checksum") {
+		if d, ok := n.res.(resource.ContentDiffer); ok {
+			before, after, usable, err := d.ContentDiff(rc.resource)
+			if err == nil && usable {
+				out.ContentBefore, out.ContentAfter, out.HasContent = before, after, true
+			}
+		}
+	}
+
 	// Attribute the drift. If the host still holds every value systemcd last
 	// wrote, the repository is what moved; if it does not, something outside
 	// systemcd edited the machine. Only the second one is an incident.
@@ -430,6 +461,19 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 			out.Action = ActionRefresh
 		}
 		return out
+	}
+
+	// If systemcd is about to take over something that already exists and has
+	// never been recorded, preserve the original contents first. After Apply
+	// the original is gone, and "release --restore" would have nothing to put
+	// back.
+	if _, owned := snap.Resources[n.id.String()]; !owned && out.Action != ActionCreate {
+		path, err := captureBaseline(rc.resource, n.res, n.id)
+		if err != nil {
+			out.Action, out.Err = ActionError, fmt.Errorf("capture baseline before adopting: %w", err)
+			return out
+		}
+		out.baselinePath = path
 	}
 
 	if !diff.Empty() {
@@ -703,6 +747,10 @@ func recordState(snap *state.Snapshot, n *node, res Result, revision string) {
 		rec.FirstAppliedAt = prev.FirstAppliedAt
 		rec.Adopted = prev.Adopted
 		rec.PriorState = prev.PriorState
+		// The baseline is captured once, at adoption. Losing it on a later
+		// apply would silently turn `release --restore` into a promise the
+		// tool could no longer keep.
+		rec.BaselinePath = prev.BaselinePath
 		rec.LastChangedAt = prev.LastChangedAt
 		if prev.Revision != "" && !res.Action.Changed() {
 			// An unchanged resource keeps the revision that last moved it,
@@ -717,6 +765,7 @@ func recordState(snap *state.Snapshot, n *node, res Result, revision string) {
 		rec.Adopted = res.Action != ActionCreate
 		if rec.Adopted {
 			rec.PriorState = map[string]string(res.observed)
+			rec.BaselinePath = res.baselinePath
 		}
 	}
 

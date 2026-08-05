@@ -20,6 +20,21 @@ var BackupDir = path.Join(DataDir, "backups")
 // hand cannot interleave with the agent's loop.
 var LockFile = path.Join(DataDir, "lock")
 
+// BaselineDir holds the exact contents a resource had at the moment systemcd
+// adopted it. Without this, "give ownership back the way you found it" is a
+// promise the tool could not keep: a checksum records that something changed,
+// not what it used to be.
+var BaselineDir = path.Join(DataDir, "baselines")
+
+// PauseFile, when present, stops the agent from converging. During an
+// incident, a self-healing agent reverting an operator's emergency change is
+// the last thing anyone needs.
+var PauseFile = path.Join(DataDir, "paused")
+
+// MetricsFile is a Prometheus textfile-collector export, so drift becomes a
+// time series without deploying anything new.
+var MetricsFile = path.Join(DataDir, "systemcd.prom")
+
 // RepoDir is where `sync` and `agent` clone the desired-state repository.
 var RepoDir = path.Join(DataDir, "repo")
 

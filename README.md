@@ -1,6 +1,6 @@
 # SystemCD
 
-**GitOps for Linux servers.** Terraform reconciles your cloud API. Argo CD
+**A lifecycle manager for Linux hosts.** Terraform reconciles your cloud API. Argo CD
 reconciles the Kubernetes API. `systemcd` reconciles the third thing nobody
 gave a controller to: **the host itself** — its systemd units, its files in
 `/etc`, its packages, its users, its kernel parameters.
@@ -183,6 +183,10 @@ something if a resource can report whether it's already satisfied, so
 | `systemcd agent` | the reconcile loop, forever | |
 | `systemcd rollback` | check out the previous applied revision and apply it | |
 | `systemcd validate` | parse and type-check manifests; no host access | `1` on invalid |
+| `systemcd inventory` | discover config this host has that systemcd does not manage | |
+| `systemcd adopt` | take ownership of existing resources without changing them | |
+| `systemcd release <ref>` | hand ownership back, preserving or restoring | |
+| `systemcd pause` / `resume` | stop the agent converging, without stopping it | |
 | `systemcd show <ref>` | ownership record for one resource | |
 | `systemcd owns <path>` | which resource owns this path/unit/package/account | |
 | `systemcd capabilities` | what systemcd can guarantee on this host | |
@@ -195,6 +199,158 @@ override node labels.
 `plan`'s exit code is the `terraform plan -detailed-exitcode` convention:
 `0` in sync, `2` drift, `1` broken. Wire it into Nagios, a CI job, or a
 `Restart=no` timer and you have fleet-wide drift alerting for free.
+
+## Onboarding a fleet you inherited
+
+Most tools assume you are starting from zero. Nobody who inherited a
+five-year-old server is. The lifecycle here is built for the other case:
+
+```
+unmanaged ──inventory──> discovered ──adopt──> owned ──release──> unmanaged
+                                                 │
+                                                 └──prune──> deleted
+```
+
+**1. Find out what is actually there.** The package manager already knows
+which of its own files somebody edited — `dpkg -V` and `rpm -Va` keep
+checksums for exactly this, and almost nobody uses them:
+
+```
+$ systemcd inventory
+modified-config (2)
+──────────────────────────────────────────────
+  path:/etc/nginx/nginx.conf  [nginx-common]
+  path:/etc/ssh/sshd_config   [openssh-server]
+
+unpackaged-config (1)
+──────────────────────────────────────────────
+  path:/etc/local-thing.conf
+```
+
+That first list is, literally, the changes nobody wrote down. Secrets
+(`/etc/shadow`, host keys, `sudoers.d`) and churn (`.dpkg-old`, cert stores)
+are excluded — an inventory that invites you to commit `/etc/shadow` is worse
+than none. A scan that cannot run says so rather than reporting a clean
+machine.
+
+**2. Turn it into a starting point.**
+
+```sh
+systemcd inventory --generate ./fleet --generate-label role=app
+```
+
+Writes `manifests/discovered.yaml` plus the extracted file payloads under
+`files/`. It is a snapshot of what *is*, not a claim about what *should be* —
+turning one into the other is your judgement, not the tool's.
+
+**3. Take ownership without changing anything.**
+
+```
+$ systemcd adopt -C ./fleet
+@ File/etc-legacyapp-app-conf  adopt
+    ownership recorded; the host was not modified
+```
+
+This is the move that makes migration politically possible. Day one does not
+rewrite the machine. The current state is recorded as the baseline, so the
+resource is owned and immediately in sync — and the *next* plan shows exactly
+what the repository would change, attributed as a repository change because
+the host still holds what systemcd recorded.
+
+**4. Now make the first real change**, and review it as a diff rather than a
+pair of hashes:
+
+```
+$ systemcd plan -C ./fleet
+~ File/etc-legacyapp-app-conf  update
+    content: +1 -1
+        # edited by someone in 2019
+      - workers = 2
+      + workers = 16
+        debug = true
+```
+
+**5. And back out if you need to.** A fleet tool without a migration-out path
+is a trap, and teams are right not to adopt one:
+
+```sh
+systemcd release File/app-conf --preserve   # forget it; leave the host as-is
+systemcd release File/app-conf --restore    # put back what was there in 2019
+```
+
+`--restore` works because adoption preserves the actual bytes under
+`/var/lib/systemcd/baselines/`, not just a checksum. Kinds that cannot
+honestly restore — a removed package cannot be un-removed to a version that
+may no longer exist in any repository — say so and offer `--preserve` instead.
+
+Releasing something the repository still declares is refused: the next
+reconcile would take it straight back, so reporting it as released would be a
+lie. Remove it from git first, or pass `--force`.
+
+## Composition, not templating
+
+Layering without a second programming language. A base declares the resource;
+a role or a single host narrows it:
+
+```yaml
+kind: Patch
+metadata:
+  name: web01-hardening
+  targets:
+    hosts: ["web01"]
+spec:
+  target: File/nginx-conf
+  patch:
+    mode: "0600"          # merged over the base spec
+    owner: null           # null removes a field — stop managing it
+```
+
+Maps merge key by key, so a patch sets one field without restating the
+resource. Scalars and sequences **replace**: there is no defensible universal
+merge for an unkeyed list, and quietly appending would make `groups: [docker]`
+mean something different in a patch than in a base. `dependsOn` and `notify`
+append, because a patch that narrows a resource must not silently drop
+ordering the base established.
+
+What this deliberately is not:
+
+```yaml
+content: "worker_processes {{ .cores }};"   # never
+```
+
+That is how every config tool grows a second, worse language, and how
+operators stop being able to tell what is actually deployed. **Transform
+structured data; do not interpolate strings.**
+
+## Operating it
+
+**Pause instead of stopping the agent.** A self-healing agent reverting an
+operator's emergency change mid-incident is the failure mode that makes teams
+turn continuous reconciliation off permanently:
+
+```sh
+systemcd pause --reason "INC-4471: nginx rolled back by hand" --for 2h
+```
+
+Drift is still detected and reported; nothing is converged. `--for` exists
+because a pause that outlives its incident is how a fleet quietly stops being
+managed. An explicit `systemcd apply` still works — that is human intent — but
+warns.
+
+**Drift becomes a Prometheus series with no new infrastructure.** The agent
+writes node_exporter textfile metrics:
+
+```
+systemcd_external_drift 2
+systemcd_out_of_sync 1
+systemcd_paused 0
+systemcd_last_reconcile_timestamp_seconds 1.7773e+09
+systemcd_resource_out_of_sync{kind="File",name="nginx-conf",origin="external"} 1
+```
+
+`systemcd_external_drift` is the one worth alerting on: the repository did not
+ask for those changes. Alert on a stale `last_reconcile_timestamp` too — a
+host that stopped reconciling shows nothing at all in per-resource metrics.
 
 ## Host targeting
 
@@ -377,30 +533,20 @@ Optional interfaces opt into more: `Refreshable` for `notify` handlers,
 
 ## Status
 
-The reconcile loop, the nine resource kinds, targeting, ownership, drift
-attribution, orphans, prune, rollback, locking and the agent all work and are
-covered by tests (`go test ./...`).
+Working and covered by tests (`go test -race ./...`): the reconcile loop, nine
+resource kinds, host targeting, ownership and claims, drift attribution,
+orphans, prune, adopt/release, inventory and manifest generation, structural
+patches, content diffs, pause, metrics, rollback, locking, and the agent.
 
-**Deliberately not doing: string templating.** Every config tool that adds
-`{{ port }}` to a YAML blob eventually reinvents Helm, Jinja or ERB, and then
-nobody knows what the final config on the box actually is. `File.source`
-points at a real file in the repo, so the diff is the diff.
+Not there yet:
 
-Composition is a different problem and is worth solving properly — the shape
-to aim for is Kustomize-style structured overlays, not interpolation:
-
-```yaml
-spec:
-  source: files/nginx.conf
-  overlays: [hosts/web01/nginx.yaml]   # not implemented yet
-```
-
-The rule to hold onto: **transform structured data, don't interpolate
-strings.**
-
-Also not there yet: secret backends, a fleet-wide view across machines, a
-`release`/disown command for handing a resource back unmanaged, and
-`Timer`/`Mount`/`Firewall` kinds.
+- **Secret backends.** `sensitive: true` keeps values out of output and state,
+  but the value still lives in git. Real secret references are the next gap.
+- **A fleet-wide view.** Everything here is per-host by design; correlating
+  400 machines currently means scraping the metrics or the `--json`.
+- **`Timer`, `Mount`, `Firewall` kinds**, and `Exec` health verification.
+- **Constraint-based package versions** (`>=1.24,<1.25`) rather than exact
+  pins, on the managers that can honour them.
 
 ## License
 

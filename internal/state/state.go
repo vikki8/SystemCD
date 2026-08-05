@@ -61,6 +61,10 @@ type Record struct {
 	// PriorState is what the host looked like immediately before systemcd
 	// first touched an adopted resource.
 	PriorState map[string]string `json:"priorState,omitempty"`
+	// BaselinePath points at a preserved copy of the resource's contents at
+	// adoption. A checksum records that a file changed; only the bytes let
+	// `release --restore` put the original back.
+	BaselinePath string `json:"baselinePath,omitempty"`
 
 	FirstAppliedAt time.Time `json:"firstAppliedAt"`
 	LastAppliedAt  time.Time `json:"lastAppliedAt"`

@@ -18,14 +18,15 @@ import (
 func runShow(app *App, args []string) int {
 	fs := newFlagSet(app, "show", "Show systemcd's ownership record for a resource (Kind/name).")
 	asJSON := fs.Bool("json", false, "emit machine-readable JSON")
-	if err := fs.Parse(args); err != nil {
+	positional, err := parseWithPositional(fs, args)
+	if err != nil {
 		return ExitError
 	}
-	if fs.NArg() != 1 {
+	if len(positional) != 1 {
 		fs.Usage()
 		return app.errf("expected exactly one resource reference, for example Service/nginx")
 	}
-	ref := fs.Arg(0)
+	ref := positional[0]
 	if _, err := resource.ParseID(ref); err != nil {
 		return app.errf("%v", err)
 	}
@@ -34,6 +35,7 @@ func runShow(app *App, args []string) int {
 	if err != nil {
 		return app.errf("%v", err)
 	}
+
 	rec, ok := snap.Resources[ref]
 	if !ok {
 		if *asJSON {
@@ -98,23 +100,24 @@ func runOwns(app *App, args []string) int {
 Accepts a bare path (/etc/nginx/nginx.conf) or an explicit claim
 (unit:nginx.service, package:nginx, user:deploy, sysctl:net.ipv4.ip_forward).`)
 	asJSON := fs.Bool("json", false, "emit machine-readable JSON")
-	if err := fs.Parse(args); err != nil {
+	positional, err := parseWithPositional(fs, args)
+	if err != nil {
 		return ExitError
 	}
-	if fs.NArg() != 1 {
+	if len(positional) != 1 {
 		fs.Usage()
 		return app.errf("expected exactly one path or claim")
 	}
 
-	target := fs.Arg(0)
+	target := positional[0]
 	claim := target
 	if strings.HasPrefix(target, "/") {
 		claim = string(resource.ClaimPath) + ":" + target
 	}
 
-	snap, err := app.snapshot()
-	if err != nil {
-		return app.errf("%v", err)
+	snap, err2 := app.snapshot()
+	if err2 != nil {
+		return app.errf("%v", err2)
 	}
 	rec, found := snap.Owner(claim)
 

@@ -393,3 +393,186 @@ func TestExternalDriftIsCalledOutByName(t *testing.T) {
 		t.Errorf("plan should attribute the drift to an external edit:\n%s", out)
 	}
 }
+
+func TestPauseStopsTheAgentConvergingButNotReporting(t *testing.T) {
+	h := newHarness(t, simpleManifest)
+
+	if code := h.app.Run([]string{"pause", "--reason", "incident 1234"}); code != ExitOK {
+		t.Fatalf("pause exit = %d: %s", code, h.stderr.String())
+	}
+	if !strings.Contains(h.stdout.String(), "incident 1234") {
+		t.Errorf("pause should confirm the reason:\n%s", h.stdout.String())
+	}
+
+	// The agent must observe and report, but not converge.
+	if code := h.run("agent", "--once"); code == ExitError {
+		t.Fatalf("agent errored while paused: %s", h.stderr.String())
+	}
+	if _, err := h.mem.Stat("/etc/motd"); err == nil {
+		t.Error("a paused host must not be converged")
+	}
+
+	if code := h.app.Run([]string{"resume"}); code != ExitOK {
+		t.Fatalf("resume exit = %d", code)
+	}
+	if code := h.run("agent", "--once"); code != ExitOK {
+		t.Fatalf("agent after resume exit = %d: %s", code, h.stderr.String())
+	}
+	if _, err := h.mem.Stat("/etc/motd"); err != nil {
+		t.Error("after resume the agent should converge again")
+	}
+}
+
+func TestPauseRequiresAReason(t *testing.T) {
+	h := newHarness(t, simpleManifest)
+	if code := h.app.Run([]string{"pause"}); code != ExitError {
+		t.Fatalf("exit = %d, want an error", code)
+	}
+	if !strings.Contains(h.stderr.String(), "--reason is required") {
+		t.Errorf("stderr = %s", h.stderr.String())
+	}
+}
+
+func TestExplicitApplyOverridesAPauseButWarns(t *testing.T) {
+	h := newHarness(t, simpleManifest)
+	if code := h.app.Run([]string{"pause", "--reason", "maintenance"}); code != ExitOK {
+		t.Fatal(h.stderr.String())
+	}
+	if code := h.run("apply"); code != ExitOK {
+		t.Fatalf("apply exit = %d: %s", code, h.stderr.String())
+	}
+	if !strings.Contains(h.stderr.String(), "paused") {
+		t.Errorf("apply should warn that the host is paused:\n%s", h.stderr.String())
+	}
+	if _, err := h.mem.Stat("/etc/motd"); err != nil {
+		t.Error("an explicit apply is human intent and should proceed")
+	}
+}
+
+func TestAgentWritesPrometheusMetrics(t *testing.T) {
+	h := newHarness(t, simpleManifest)
+	if code := h.run("agent", "--once"); code != ExitOK {
+		t.Fatalf("agent exit = %d: %s", code, h.stderr.String())
+	}
+
+	data, err := h.mem.ReadFile("/var/lib/systemcd/systemcd.prom")
+	if err != nil {
+		t.Fatalf("metrics were not written: %v", err)
+	}
+	body := string(data)
+	for _, want := range []string{
+		"# TYPE systemcd_resources_total gauge",
+		"systemcd_external_drift",
+		"systemcd_paused 0",
+		"systemcd_resource_out_of_sync{kind=\"File\",name=\"motd\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPlanShowsTheLinesThatChanged(t *testing.T) {
+	// A checksum pair is not reviewable; the actual lines are.
+	h := newHarness(t, simpleManifest)
+	if code := h.run("apply"); code != ExitOK {
+		t.Fatal(h.stderr.String())
+	}
+	h.mem.SetFile("/etc/motd", "welcome to the fleet\nEXTRA LINE\n", 0o644, 0, 0)
+
+	if code := h.run("plan"); code != ExitOutOfSync {
+		t.Fatalf("plan exit = %d", code)
+	}
+	out := h.stdout.String()
+	if !strings.Contains(out, "- EXTRA LINE") {
+		t.Errorf("plan should show the removed line:\n%s", out)
+	}
+	if strings.Contains(out, "checksum: sha256") {
+		t.Errorf("a raw checksum pair should be replaced by the content diff:\n%s", out)
+	}
+}
+
+func TestAdoptAndReleaseRoundTripThroughTheCLI(t *testing.T) {
+	h := newHarness(t, simpleManifest)
+	h.mem.SetFile("/etc/motd", "the original banner\n", 0o644, 0, 0)
+
+	if code := h.run("adopt"); code != ExitOK {
+		t.Fatalf("adopt exit = %d: %s", code, h.stderr.String())
+	}
+	if got, _ := h.mem.ReadFile("/etc/motd"); string(got) != "the original banner\n" {
+		t.Fatalf("adopt must not change the host, got %q", got)
+	}
+
+	h.stdout.Reset()
+	if code := h.app.Run([]string{"show", "File/motd"}); code != ExitOK {
+		t.Fatal("show failed")
+	}
+	if !strings.Contains(h.stdout.String(), "adopted") {
+		t.Errorf("show should report adoption:\n%s", h.stdout.String())
+	}
+
+	if code := h.run("apply"); code != ExitOK {
+		t.Fatalf("apply exit = %d: %s", code, h.stderr.String())
+	}
+
+	// Releasing while the repository still declares it must be refused.
+	if code := h.run("release", "File/motd"); code != ExitError {
+		t.Errorf("release exit = %d, want a refusal while the repo still declares it", code)
+	}
+
+	if code := h.run("release", "--restore", "--force", "File/motd"); code != ExitOK {
+		t.Fatalf("forced release exit = %d: %s\n%s", code, h.stderr.String(), h.stdout.String())
+	}
+	if got, _ := h.mem.ReadFile("/etc/motd"); string(got) != "the original banner\n" {
+		t.Errorf("restore should put the original back, got %q", got)
+	}
+
+	h.stdout.Reset()
+	h.app.Run([]string{"owns", "/etc/motd"})
+	if !strings.Contains(h.stdout.String(), "not managed") {
+		t.Errorf("after release the path should be unowned:\n%s", h.stdout.String())
+	}
+}
+
+func TestInventoryReportsUnmanagedConfiguration(t *testing.T) {
+	h := newHarness(t, simpleManifest)
+	h.mem.Binaries["dpkg"] = true
+	h.mem.Binaries["dpkg-query"] = true
+	h.mem.AddStub(host.CommandStub{Match: "dpkg -V", Stdout: "??5??????   c /etc/nginx/nginx.conf\n"})
+	h.mem.AddStub(host.CommandStub{Match: "dpkg-query -S", Stdout: "nginx-common: /etc/nginx/nginx.conf"})
+	h.mem.SetFile("/etc/nginx/nginx.conf", "worker_processes 4;\n", 0o644, 0, 0)
+
+	if code := h.app.Run([]string{"inventory"}); code != ExitOK {
+		t.Fatalf("inventory exit = %d: %s", code, h.stderr.String())
+	}
+	out := h.stdout.String()
+	if !strings.Contains(out, "modified-config") || !strings.Contains(out, "/etc/nginx/nginx.conf") {
+		t.Errorf("inventory should report the hand-edited config:\n%s", out)
+	}
+	if !strings.Contains(out, "systemcd adopt") {
+		t.Errorf("inventory should point at the next step:\n%s", out)
+	}
+}
+
+func TestFlagsAfterPositionalArgumentsAreHonoured(t *testing.T) {
+	// Go's flag package stops at the first positional argument. Operators do
+	// not order their arguments to suit a parser, and a silently dropped -C
+	// would point the command at the wrong repository.
+	h := newHarness(t, simpleManifest)
+	h.mem.SetFile("/etc/motd", "original\n", 0o644, 0, 0)
+	if code := h.run("adopt"); code != ExitOK {
+		t.Fatal(h.stderr.String())
+	}
+
+	h.stdout.Reset()
+	if code := h.app.Run([]string{"show", "File/motd", "--json"}); code != ExitOK {
+		t.Fatalf("show exit = %d", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(h.stdout.Bytes(), &got); err != nil {
+		t.Fatalf("--json after a positional arg was ignored; output was:\n%s", h.stdout.String())
+	}
+	if got["owned"] != true {
+		t.Errorf("payload = %v", got)
+	}
+}

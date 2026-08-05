@@ -13,6 +13,7 @@ import (
 	"github.com/vikki8/systemcd/internal/engine"
 	"github.com/vikki8/systemcd/internal/resource"
 	"github.com/vikki8/systemcd/internal/state"
+	"github.com/vikki8/systemcd/internal/textdiff"
 )
 
 // Options control rendering.
@@ -23,6 +24,10 @@ type Options struct {
 	Verbose bool
 	// ShowDiff prints per-field differences.
 	ShowDiff bool
+	// NoContentDiff suppresses the unified text diff for file contents.
+	NoContentDiff bool
+	// DiffContext is the number of unchanged lines shown around a change.
+	DiffContext int
 }
 
 // DetectColor reports whether the writer looks like an interactive terminal
@@ -75,6 +80,12 @@ func actionStyle(p palette, a engine.Action) (string, string) {
 		return "!", p.red
 	case engine.ActionOrphan:
 		return "?", p.yellow
+	case engine.ActionAdopt:
+		return "@", p.cyan
+	case engine.ActionRelease:
+		return "!", p.yellow
+	case engine.ActionRestore:
+		return "<", p.yellow
 	case engine.ActionSkip:
 		return "·", p.dim
 	default:
@@ -86,9 +97,16 @@ func actionStyle(p palette, a engine.Action) (string, string) {
 func Text(w io.Writer, r *engine.Report, opts Options) error {
 	p := newPalette(opts.Color)
 
-	verb := "apply"
+	verb := r.Operation
+	if verb == "" {
+		verb = "apply"
+	}
 	if r.DryRun {
-		verb = "plan"
+		if verb == "apply" {
+			verb = "plan"
+		} else {
+			verb += " (dry run)"
+		}
 	}
 	header := fmt.Sprintf("systemcd %s", verb)
 	if r.Revision != "" {
@@ -107,6 +125,14 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 
 		if opts.ShowDiff {
 			for _, f := range res.Diff {
+				// A checksum pair is not reviewable, and the text diff below
+				// says the same thing in a form a human can approve.
+				if f.Field == "checksum" && res.HasContent && !opts.NoContentDiff {
+					added, removed := textdiff.Stat(res.ContentBefore, res.ContentAfter)
+					fmt.Fprintf(w, "    %scontent%s: %s+%d%s %s-%d%s\n",
+						p.dim, p.reset, p.green, added, p.reset, p.red, removed, p.reset)
+					continue
+				}
 				have, want := f.Have, f.Want
 				if f.Sensitive {
 					have, want = "(sensitive)", "(sensitive)"
@@ -115,6 +141,9 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 					p.dim, f.Field, p.reset,
 					p.red, truncate(have), p.reset,
 					p.green, truncate(want), p.reset)
+			}
+			if res.HasContent && !opts.NoContentDiff {
+				renderContentDiff(w, p, res)
 			}
 		}
 		if res.Owner.Origin == state.OriginExternal {
@@ -155,6 +184,12 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 	if c.Orphaned > 0 {
 		fmt.Fprintf(w, " · %s%d orphaned%s", p.yellow, c.Orphaned, p.reset)
 	}
+	if c.Adopted > 0 {
+		fmt.Fprintf(w, " · %s%d adopted%s", p.cyan, c.Adopted, p.reset)
+	}
+	if c.Released > 0 {
+		fmt.Fprintf(w, " · %s%d released%s", p.yellow, c.Released, p.reset)
+	}
 	fmt.Fprintf(w, "\n%stook %s%s\n", p.dim, r.Finished.Sub(r.Started).Round(time.Millisecond), p.reset)
 
 	// External drift is the line worth waking someone for: the repository did
@@ -175,6 +210,27 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 		fmt.Fprintf(w, "\n%snote: %s%s\n", p.dim, note, p.reset)
 	}
 	return nil
+}
+
+// renderContentDiff prints the lines that actually differ inside a file.
+func renderContentDiff(w io.Writer, p palette, res engine.Result) {
+	opts := textdiff.DefaultOptions()
+	lines := textdiff.Unified(res.ContentBefore, res.ContentAfter, opts)
+	if len(lines) == 0 {
+		return
+	}
+	for _, line := range lines {
+		switch line.Kind {
+		case '+':
+			fmt.Fprintf(w, "      %s+ %s%s\n", p.green, line.Text, p.reset)
+		case '-':
+			fmt.Fprintf(w, "      %s- %s%s\n", p.red, line.Text, p.reset)
+		case '@', '!':
+			fmt.Fprintf(w, "      %s%s%s\n", p.dim, line.Text, p.reset)
+		default:
+			fmt.Fprintf(w, "      %s  %s%s\n", p.dim, line.Text, p.reset)
+		}
+	}
 }
 
 // relative renders a timestamp the way an operator reads it mid-incident.
@@ -342,6 +398,7 @@ type jsonReport struct {
 	Status     string        `json:"status"`
 	OutOfSync  bool          `json:"outOfSync"`
 	Counts     engine.Counts `json:"counts"`
+	Operation  string        `json:"operation,omitempty"`
 	DurationMS int64         `json:"durationMs"`
 	Notes      []string      `json:"notes,omitempty"`
 	Results    []jsonResult  `json:"results"`
@@ -363,6 +420,7 @@ func JSON(w io.Writer, r *engine.Report) error {
 		DryRun:     r.DryRun,
 		OutOfSync:  r.OutOfSync(),
 		Counts:     r.Counts(),
+		Operation:  r.Operation,
 		DurationMS: r.Finished.Sub(r.Started).Milliseconds(),
 		Notes:      r.Notes,
 	}

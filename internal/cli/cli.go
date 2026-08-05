@@ -54,6 +54,11 @@ func commands() []command {
 		{"agent", "run the reconcile loop continuously", runAgent},
 		{"rollback", "reapply the previously applied revision", runRollback},
 		{"validate", "check manifests without contacting the host", runValidate},
+		{"inventory", "discover configuration this host has that systemcd does not manage", runInventory},
+		{"adopt", "take ownership of existing resources without changing them", runAdopt},
+		{"release", "hand ownership back, preserving or restoring the host", runRelease},
+		{"pause", "stop the agent converging this host, without stopping it", runPause},
+		{"resume", "let the agent converge this host again", runResume},
 		{"show", "show systemcd's ownership record for a resource", runShow},
 		{"owns", "report which resource owns a path, unit, package or account", runOwns},
 		{"capabilities", "report what systemcd can guarantee on this host", runCapabilities},
@@ -135,6 +140,9 @@ type commonFlags struct {
 	hostname string
 	health   bool
 	confirm  bool
+	// noContentDiff hides the unified text diff of file contents, which is
+	// useful when plan output is being piped somewhere narrow.
+	noContentDiff bool
 }
 
 func (f *commonFlags) register(fs *flag.FlagSet, withPrune bool) {
@@ -146,6 +154,7 @@ func (f *commonFlags) register(fs *flag.FlagSet, withPrune bool) {
 	fs.Var(&f.labels, "label", "node label as key=value, for host targeting; repeatable")
 	fs.StringVar(&f.hostname, "hostname", "", "override the detected hostname for targeting")
 	fs.BoolVar(&f.health, "health", true, "run post-apply health checks")
+	fs.BoolVar(&f.noContentDiff, "no-content-diff", false, "show checksums instead of the lines that changed inside files")
 	if withPrune {
 		fs.BoolVar(&f.prune, "prune", false, "delete resources removed from the repository")
 		fs.BoolVar(&f.noPrune, "no-prune", false, "never prune, overriding the repo config")
