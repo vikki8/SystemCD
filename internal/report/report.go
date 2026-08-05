@@ -12,6 +12,8 @@ import (
 
 	"github.com/vikki8/systemcd/internal/engine"
 	"github.com/vikki8/systemcd/internal/resource"
+	"github.com/vikki8/systemcd/internal/state"
+	"github.com/vikki8/systemcd/internal/textdiff"
 )
 
 // Options control rendering.
@@ -22,6 +24,10 @@ type Options struct {
 	Verbose bool
 	// ShowDiff prints per-field differences.
 	ShowDiff bool
+	// NoContentDiff suppresses the unified text diff for file contents.
+	NoContentDiff bool
+	// DiffContext is the number of unchanged lines shown around a change.
+	DiffContext int
 }
 
 // DetectColor reports whether the writer looks like an interactive terminal
@@ -72,6 +78,14 @@ func actionStyle(p palette, a engine.Action) (string, string) {
 		return "↻", p.magenta
 	case engine.ActionError:
 		return "!", p.red
+	case engine.ActionOrphan:
+		return "?", p.yellow
+	case engine.ActionAdopt:
+		return "@", p.cyan
+	case engine.ActionRelease:
+		return "!", p.yellow
+	case engine.ActionRestore:
+		return "<", p.yellow
 	case engine.ActionSkip:
 		return "·", p.dim
 	default:
@@ -83,9 +97,16 @@ func actionStyle(p palette, a engine.Action) (string, string) {
 func Text(w io.Writer, r *engine.Report, opts Options) error {
 	p := newPalette(opts.Color)
 
-	verb := "apply"
+	verb := r.Operation
+	if verb == "" {
+		verb = "apply"
+	}
 	if r.DryRun {
-		verb = "plan"
+		if verb == "apply" {
+			verb = "plan"
+		} else {
+			verb += " (dry run)"
+		}
 	}
 	header := fmt.Sprintf("systemcd %s", verb)
 	if r.Revision != "" {
@@ -104,6 +125,14 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 
 		if opts.ShowDiff {
 			for _, f := range res.Diff {
+				// A checksum pair is not reviewable, and the text diff below
+				// says the same thing in a form a human can approve.
+				if f.Field == "checksum" && res.HasContent && !opts.NoContentDiff {
+					added, removed := textdiff.Stat(res.ContentBefore, res.ContentAfter)
+					fmt.Fprintf(w, "    %scontent%s: %s+%d%s %s-%d%s\n",
+						p.dim, p.reset, p.green, added, p.reset, p.red, removed, p.reset)
+					continue
+				}
 				have, want := f.Have, f.Want
 				if f.Sensitive {
 					have, want = "(sensitive)", "(sensitive)"
@@ -113,6 +142,13 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 					p.red, truncate(have), p.reset,
 					p.green, truncate(want), p.reset)
 			}
+			if res.HasContent && !opts.NoContentDiff {
+				renderContentDiff(w, p, res)
+			}
+		}
+		if res.Owner.Origin == state.OriginExternal {
+			fmt.Fprintf(w, "    %schanged outside systemcd since %s%s\n",
+				p.red, relative(res.Owner.LastAppliedAt), p.reset)
 		}
 		for _, m := range res.Messages {
 			fmt.Fprintf(w, "    %s%s%s\n", p.dim, m, p.reset)
@@ -145,8 +181,74 @@ func Text(w io.Writer, r *engine.Report, opts Options) error {
 	if c.Degraded > 0 {
 		fmt.Fprintf(w, " · %s%d degraded%s", p.red, c.Degraded, p.reset)
 	}
+	if c.Orphaned > 0 {
+		fmt.Fprintf(w, " · %s%d orphaned%s", p.yellow, c.Orphaned, p.reset)
+	}
+	if c.Adopted > 0 {
+		fmt.Fprintf(w, " · %s%d adopted%s", p.cyan, c.Adopted, p.reset)
+	}
+	if c.Released > 0 {
+		fmt.Fprintf(w, " · %s%d released%s", p.yellow, c.Released, p.reset)
+	}
 	fmt.Fprintf(w, "\n%stook %s%s\n", p.dim, r.Finished.Sub(r.Started).Round(time.Millisecond), p.reset)
+
+	// External drift is the line worth waking someone for: the repository did
+	// not ask for these to change, so something else edited the machine.
+	if c.ExternalDrift > 0 {
+		fmt.Fprintf(w, "\n%s%d resource(s) were changed outside systemcd since the last apply:%s\n",
+			p.red, c.ExternalDrift, p.reset)
+		for _, res := range r.ExternalDrift() {
+			fmt.Fprintf(w, "  %s (last applied %s)\n", res.ID, relative(res.Owner.LastAppliedAt))
+		}
+	}
+	if c.NeedsConfirm > 0 {
+		fmt.Fprintf(w, "\n%s%d resource(s) were left in place because pruning them is irreversible.%s\n",
+			p.yellow, c.NeedsConfirm, p.reset)
+		fmt.Fprintf(w, "%sRe-run with --confirm to allow it.%s\n", p.dim, p.reset)
+	}
+	for _, note := range r.Notes {
+		fmt.Fprintf(w, "\n%snote: %s%s\n", p.dim, note, p.reset)
+	}
 	return nil
+}
+
+// renderContentDiff prints the lines that actually differ inside a file.
+func renderContentDiff(w io.Writer, p palette, res engine.Result) {
+	opts := textdiff.DefaultOptions()
+	lines := textdiff.Unified(res.ContentBefore, res.ContentAfter, opts)
+	if len(lines) == 0 {
+		return
+	}
+	for _, line := range lines {
+		switch line.Kind {
+		case '+':
+			fmt.Fprintf(w, "      %s+ %s%s\n", p.green, line.Text, p.reset)
+		case '-':
+			fmt.Fprintf(w, "      %s- %s%s\n", p.red, line.Text, p.reset)
+		case '@', '!':
+			fmt.Fprintf(w, "      %s%s%s\n", p.dim, line.Text, p.reset)
+		default:
+			fmt.Fprintf(w, "      %s  %s%s\n", p.dim, line.Text, p.reset)
+		}
+	}
+}
+
+// relative renders a timestamp the way an operator reads it mid-incident.
+func relative(t time.Time) string {
+	if t.IsZero() {
+		return "an unknown time"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "less than a minute ago"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago (%s)", int(d.Hours()/24), t.Local().Format("2006-01-02 15:04"))
+	}
 }
 
 func changeWord(dryRun bool) string {
@@ -175,16 +277,20 @@ func syncStatus(p palette, r *engine.Report) (string, string) {
 // Status renders the Argo-style per-resource sync table.
 func Status(w io.Writer, r *engine.Report, opts Options) error {
 	p := newPalette(opts.Color)
-	fmt.Fprintf(w, "%s%-30s %-12s %-10s %s%s\n", p.bold, "RESOURCE", "SYNC", "HEALTH", "DETAIL", p.reset)
+	fmt.Fprintf(w, "%s%-28s %-11s %-9s %-9s %-14s %s%s\n",
+		p.bold, "RESOURCE", "SYNC", "HEALTH", "OWNED", "LAST CHANGED", "DETAIL", p.reset)
 
 	results := append([]engine.Result(nil), r.Results...)
 	sort.SliceStable(results, func(i, j int) bool { return results[i].ID.String() < results[j].ID.String() })
 
 	for _, res := range results {
 		sync, syncColor := "Synced", p.green
-		if res.Err != nil {
+		switch {
+		case res.Err != nil:
 			sync, syncColor = "Error", p.red
-		} else if res.OutOfSync() {
+		case res.Action == engine.ActionOrphan:
+			sync, syncColor = "Orphaned", p.yellow
+		case res.OutOfSync():
 			sync, syncColor = "OutOfSync", p.yellow
 		}
 
@@ -198,21 +304,49 @@ func Status(w io.Writer, r *engine.Report, opts Options) error {
 			health, healthColor = "Unknown", p.yellow
 		}
 
+		owned, ownedColor := "no", p.dim
+		if res.Owner.Owned {
+			owned, ownedColor = "yes", p.green
+			if res.Owner.Adopted {
+				owned = "adopted"
+			}
+		}
+
 		detail := ""
 		switch {
 		case res.Err != nil:
 			detail = res.Err.Error()
+		case res.Owner.Origin == state.OriginExternal:
+			// Naming the cause beats listing the fields: an external edit is a
+			// different problem from the repository moving ahead.
+			detail = "changed outside systemcd: " + strings.Join(diffFields(res.Diff), ", ")
 		case len(res.Diff) > 0:
 			detail = strings.Join(diffFields(res.Diff), ", ")
+		case len(res.Messages) > 0:
+			detail = res.Messages[0]
 		}
 
-		fmt.Fprintf(w, "%s%-30s%s %s%-12s%s %s%-10s%s %s%s%s\n",
-			p.reset, res.ID.String(), p.reset,
+		fmt.Fprintf(w, "%s%-28s%s %s%-11s%s %s%-9s%s %s%-9s%s %-14s %s%s%s\n",
+			p.reset, truncateTo(res.ID.String(), 28), p.reset,
 			syncColor, sync, p.reset,
 			healthColor, health, p.reset,
+			ownedColor, owned, p.reset,
+			lastChanged(res),
 			p.dim, truncate(detail), p.reset)
 	}
 	return nil
+}
+
+// lastChanged renders when systemcd last modified the resource, which is not
+// the same question as when it last confirmed it.
+func lastChanged(res engine.Result) string {
+	if !res.Owner.Owned {
+		return "-"
+	}
+	if res.Owner.LastChangedAt.IsZero() {
+		return "never"
+	}
+	return relative(res.Owner.LastChangedAt)
 }
 
 func diffFields(d resource.Diff) []string {
@@ -225,18 +359,31 @@ func diffFields(d resource.Diff) []string {
 
 // jsonResult is the stable machine-readable shape.
 type jsonResult struct {
-	Resource string            `json:"resource"`
-	Kind     string            `json:"kind"`
-	Name     string            `json:"name"`
-	Action   string            `json:"action"`
-	Sync     string            `json:"sync"`
-	Health   string            `json:"health,omitempty"`
-	Detail   string            `json:"healthDetail,omitempty"`
-	Diff     []jsonFieldDiff   `json:"diff,omitempty"`
-	Messages []string          `json:"messages,omitempty"`
-	Error    string            `json:"error,omitempty"`
-	Source   string            `json:"source,omitempty"`
-	Extra    map[string]string `json:"-"`
+	Resource string          `json:"resource"`
+	Kind     string          `json:"kind"`
+	Name     string          `json:"name"`
+	Action   string          `json:"action"`
+	Sync     string          `json:"sync"`
+	Health   string          `json:"health,omitempty"`
+	Detail   string          `json:"healthDetail,omitempty"`
+	Diff     []jsonFieldDiff `json:"diff,omitempty"`
+	Messages []string        `json:"messages,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Source   string          `json:"source,omitempty"`
+	Owner    jsonOwnership   `json:"ownership"`
+}
+
+// jsonOwnership is what a monitoring system needs to distinguish "the repo
+// changed" from "someone edited the box".
+type jsonOwnership struct {
+	Owned          bool       `json:"owned"`
+	Adopted        bool       `json:"adopted,omitempty"`
+	Claims         []string   `json:"claims,omitempty"`
+	DriftOrigin    string     `json:"driftOrigin,omitempty"`
+	FirstAppliedAt *time.Time `json:"firstAppliedAt,omitempty"`
+	LastAppliedAt  *time.Time `json:"lastAppliedAt,omitempty"`
+	LastChangedAt  *time.Time `json:"lastChangedAt,omitempty"`
+	Revision       string     `json:"revision,omitempty"`
 }
 
 type jsonFieldDiff struct {
@@ -251,8 +398,18 @@ type jsonReport struct {
 	Status     string        `json:"status"`
 	OutOfSync  bool          `json:"outOfSync"`
 	Counts     engine.Counts `json:"counts"`
+	Operation  string        `json:"operation,omitempty"`
 	DurationMS int64         `json:"durationMs"`
+	Notes      []string      `json:"notes,omitempty"`
 	Results    []jsonResult  `json:"results"`
+}
+
+// nonZero omits zero timestamps from JSON rather than emitting year 1.
+func nonZero(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // JSON renders a report as machine-readable output, for pipelines and for
@@ -263,7 +420,9 @@ func JSON(w io.Writer, r *engine.Report) error {
 		DryRun:     r.DryRun,
 		OutOfSync:  r.OutOfSync(),
 		Counts:     r.Counts(),
+		Operation:  r.Operation,
 		DurationMS: r.Finished.Sub(r.Started).Milliseconds(),
+		Notes:      r.Notes,
 	}
 	status, _ := syncStatus(palette{}, r)
 	out.Status = status
@@ -282,6 +441,19 @@ func JSON(w io.Writer, r *engine.Report) error {
 		}
 		if res.OutOfSync() {
 			jr.Sync = "OutOfSync"
+		}
+		if res.Action == engine.ActionOrphan {
+			jr.Sync = "Orphaned"
+		}
+		jr.Owner = jsonOwnership{
+			Owned:          res.Owner.Owned,
+			Adopted:        res.Owner.Adopted,
+			Claims:         res.Owner.Claims,
+			DriftOrigin:    string(res.Owner.Origin),
+			FirstAppliedAt: nonZero(res.Owner.FirstAppliedAt),
+			LastAppliedAt:  nonZero(res.Owner.LastAppliedAt),
+			LastChangedAt:  nonZero(res.Owner.LastChangedAt),
+			Revision:       res.Owner.Revision,
 		}
 		if res.Err != nil {
 			jr.Sync = "Error"
@@ -302,8 +474,9 @@ func JSON(w io.Writer, r *engine.Report) error {
 	return enc.Encode(out)
 }
 
-func truncate(s string) string {
-	const max = 72
+func truncate(s string) string { return truncateTo(s, 72) }
+
+func truncateTo(s string, max int) string {
 	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
 	if len(s) <= max {
 		return s

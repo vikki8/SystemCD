@@ -158,11 +158,26 @@ func (p *Package) Delete(c *Context) error {
 	return mgr.remove(c, p.names)
 }
 
+// manager resolves the package manager and refuses up front if the manifest
+// asked for something this manager cannot deliver.
 func (p *Package) manager(c *Context) (*packageManager, error) {
+	var mgr *packageManager
 	if p.spec.Manager != "" {
-		return managers[p.spec.Manager], nil
+		mgr = managers[p.spec.Manager]
+	} else {
+		detected, err := detectManager(c)
+		if err != nil {
+			return nil, err
+		}
+		mgr = detected
 	}
-	return detectManager(c)
+	if p.spec.Version != "" && !mgr.pinnable {
+		return nil, fmt.Errorf(
+			"spec.version is not supported with the %s package manager: %s. "+
+				"Declare the package without a version, or pin it in the repository configuration for %s instead",
+			mgr.name, mgr.pinNote, mgr.name)
+	}
+	return mgr, nil
 }
 
 // packageManager adapts one distro package tool to a common interface.
@@ -175,6 +190,34 @@ type packageManager struct {
 	remove  func(c *Context, pkgs []string) error
 	update  func(c *Context) error
 	pin     func(pkg, version string) string
+	// pinnable records whether systemcd can actually *guarantee* convergence
+	// to an exact version with this manager: install a specific version,
+	// downgrade to it if a newer one is present, and read back a version
+	// string in the same form the manifest wrote.
+	//
+	// Where it cannot, `spec.version` is rejected rather than silently
+	// accepted. A field that sometimes converges and sometimes reports
+	// permanent drift is worse than no field at all.
+	pinnable bool
+	// pinNote explains the refusal.
+	pinNote string
+}
+
+// Capabilities describes what a host's package manager can guarantee, so the
+// answer is knowable before a manifest is written.
+type Capabilities struct {
+	Manager        string
+	VersionPinning bool
+	Note           string
+}
+
+// DetectCapabilities reports the package-management capabilities of a host.
+func DetectCapabilities(c *Context) (Capabilities, error) {
+	mgr, err := detectManager(c)
+	if err != nil {
+		return Capabilities{}, err
+	}
+	return Capabilities{Manager: mgr.name, VersionPinning: mgr.pinnable, Note: mgr.pinNote}, nil
 }
 
 // detectionOrder is deliberate: a machine may carry more than one tool (a
@@ -268,22 +311,25 @@ func init() {
 			remove: func(c *Context, p []string) error {
 				return runManager(c, "DEBIAN_FRONTEND=noninteractive apt-get remove -y "+quoteAll(p))
 			},
-			update: func(c *Context) error { return runManager(c, "apt-get update") },
-			pin:    func(pkg, v string) string { return pkg + "=" + v },
+			update:   func(c *Context) error { return runManager(c, "apt-get update") },
+			pin:      func(pkg, v string) string { return pkg + "=" + v },
+			pinnable: true,
 		},
 		"dnf": {
 			name: "dnf", binary: "dnf", query: rpmQuery,
-			install: func(c *Context, p []string) error { return runManager(c, "dnf install -y "+quoteAll(p)) },
-			remove:  func(c *Context, p []string) error { return runManager(c, "dnf remove -y "+quoteAll(p)) },
-			update:  func(c *Context) error { return runManager(c, "dnf makecache") },
-			pin:     func(pkg, v string) string { return pkg + "-" + v },
+			install:  func(c *Context, p []string) error { return runManager(c, "dnf install -y "+quoteAll(p)) },
+			remove:   func(c *Context, p []string) error { return runManager(c, "dnf remove -y "+quoteAll(p)) },
+			update:   func(c *Context) error { return runManager(c, "dnf makecache") },
+			pin:      func(pkg, v string) string { return pkg + "-" + v },
+			pinnable: true,
 		},
 		"yum": {
 			name: "yum", binary: "yum", query: rpmQuery,
-			install: func(c *Context, p []string) error { return runManager(c, "yum install -y "+quoteAll(p)) },
-			remove:  func(c *Context, p []string) error { return runManager(c, "yum remove -y "+quoteAll(p)) },
-			update:  func(c *Context) error { return runManager(c, "yum makecache") },
-			pin:     func(pkg, v string) string { return pkg + "-" + v },
+			install:  func(c *Context, p []string) error { return runManager(c, "yum install -y "+quoteAll(p)) },
+			remove:   func(c *Context, p []string) error { return runManager(c, "yum remove -y "+quoteAll(p)) },
+			update:   func(c *Context) error { return runManager(c, "yum makecache") },
+			pin:      func(pkg, v string) string { return pkg + "-" + v },
+			pinnable: true,
 		},
 		"zypper": {
 			name: "zypper", binary: "zypper", query: rpmQuery,
@@ -293,8 +339,9 @@ func init() {
 			remove: func(c *Context, p []string) error {
 				return runManager(c, "zypper --non-interactive remove "+quoteAll(p))
 			},
-			update: func(c *Context) error { return runManager(c, "zypper --non-interactive refresh") },
-			pin:    func(pkg, v string) string { return pkg + "-" + v },
+			update:   func(c *Context) error { return runManager(c, "zypper --non-interactive refresh") },
+			pin:      func(pkg, v string) string { return pkg + "-" + v },
+			pinnable: true,
 		},
 		"pacman": {
 			name: "pacman", binary: "pacman",
@@ -318,6 +365,8 @@ func init() {
 			remove: func(c *Context, p []string) error { return runManager(c, "pacman -R --noconfirm "+quoteAll(p)) },
 			update: func(c *Context) error { return runManager(c, "pacman -Sy --noconfirm") },
 			pin:    func(pkg, v string) string { return pkg + "=" + v },
+			pinNote: "pacman installs whatever version the repository currently carries and has no supported " +
+				"way to request an older one, so a pinned version could never converge",
 		},
 		"apk": {
 			name: "apk", binary: "apk",
@@ -338,6 +387,9 @@ func init() {
 			remove:  func(c *Context, p []string) error { return runManager(c, "apk del "+quoteAll(p)) },
 			update:  func(c *Context) error { return runManager(c, "apk update") },
 			pin:     func(pkg, v string) string { return pkg + "=" + v },
+			pinNote: "apk pins depend on the version still being present in the configured repository, the " +
+				"installed version string does not round-trip with what a manifest writes, and downgrades " +
+				"need --allow-untrusted; systemcd cannot promise convergence",
 		},
 	}
 }

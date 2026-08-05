@@ -1,0 +1,34 @@
+# Host- and role-specific narrowing, applied as structural patches over the
+# base manifests. This is the composition layer: base + role + host, merged as
+# data. Nothing is interpolated into a string, so what is in git is what lands
+# on the machine.
+
+apiVersion: systemcd.dev/v1
+kind: Patch
+metadata:
+  name: prod-web-hardening
+  targets:
+    labels:
+      role: web
+      env: prod
+spec:
+  target: File/nginx-conf
+  # Only the fields named here change; everything else in the base survives.
+  patch:
+    mode: "0600"
+---
+apiVersion: systemcd.dev/v1
+kind: Patch
+metadata:
+  name: web01-billing-env
+  targets:
+    hosts: ["web01", "web01.*"]
+spec:
+  target: File/billing-env
+  patch:
+    content: |
+      LISTEN_ADDR=127.0.0.1:8080
+      LOG_LEVEL=debug
+  # Appends to whatever the base already notifies, rather than replacing it.
+  notify:
+    - Service/nginx

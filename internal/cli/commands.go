@@ -9,10 +9,32 @@ import (
 	"github.com/vikki8/systemcd/internal/engine"
 	"github.com/vikki8/systemcd/internal/gitsync"
 	"github.com/vikki8/systemcd/internal/manifest"
+	"github.com/vikki8/systemcd/internal/metrics"
 	"github.com/vikki8/systemcd/internal/paths"
 	"github.com/vikki8/systemcd/internal/report"
-	"github.com/vikki8/systemcd/internal/state"
 )
+
+// parseWithPositional parses flags that may appear before, after, or between
+// positional arguments.
+//
+// Go's flag package stops at the first non-flag argument, which would make
+// `systemcd release File/motd -C /repo` silently ignore -C. Operators do not
+// order their arguments to suit an argument parser, and a flag that is quietly
+// dropped is worse than one that errors.
+func parseWithPositional(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positional, nil
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
+	}
+}
 
 func newFlagSet(app *App, name, usage string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -48,7 +70,7 @@ func runPlan(app *App, args []string) int {
 		Prune:    resolvePrune(repo.Config, &f),
 		Revision: app.revision(ctx, repo.Root),
 		Only:     f.only,
-		Store:    state.New(app.Host),
+		Store:    app.storeFor(),
 	})
 	if err != nil {
 		return app.errf("%v", err)
@@ -69,15 +91,22 @@ func runApply(app *App, args []string) int {
 		return app.errf("%v", err)
 	}
 	app.warnIfNotRoot()
+	// A hand-run apply is explicit human intent, so the pause does not block
+	// it — but the operator should know the agent is meant to be holding off.
+	if rec, paused := readPause(app.Host); paused {
+		fmt.Fprintf(app.Stderr, "systemcd: warning: this host is paused (%s); applying anyway because you asked directly\n", rec.Reason)
+	}
 
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	rep, err := app.apply(ctx, repo, node, &f, app.revision(ctx, repo.Root))
-	if err != nil {
-		return app.errf("%v", err)
-	}
-	return app.emit(rep, &f, false)
+	return app.withLock(func() int {
+		rep, err := app.apply(ctx, repo, node, &f, app.revision(ctx, repo.Root))
+		if err != nil {
+			return app.errf("%v", err)
+		}
+		return app.emit(rep, &f, false)
+	})
 }
 
 func runStatus(app *App, args []string) int {
@@ -102,18 +131,24 @@ func runStatus(app *App, args []string) int {
 		Node:   node,
 		DryRun: true,
 		Only:   f.only,
-		Store:  state.New(app.Host),
+		Store:  app.storeFor(),
 	})
 	if err != nil {
 		return app.errf("%v", err)
 	}
 
+	rec, paused := readPause(app.Host)
 	if f.json {
 		if err := report.JSON(app.Stdout, rep); err != nil {
 			return app.errf("%v", err)
 		}
-	} else if err := report.Status(app.Stdout, rep, app.reportOptions(&f)); err != nil {
-		return app.errf("%v", err)
+	} else {
+		if paused {
+			fmt.Fprintf(app.Stdout, "PAUSED since %s: %s\n\n", rec.Since.Local().Format("2006-01-02 15:04 MST"), rec.Reason)
+		}
+		if err := report.Status(app.Stdout, rep, app.reportOptions(&f)); err != nil {
+			return app.errf("%v", err)
+		}
 	}
 	if rep.Err() != nil {
 		return ExitError
@@ -174,11 +209,13 @@ func runSync(app *App, args []string) int {
 	if err != nil {
 		return app.errf("%v", err)
 	}
-	rep, err := app.apply(ctx, repo, node, &f, rev)
-	if err != nil {
-		return app.errf("%v", err)
-	}
-	return app.emit(rep, &f, false)
+	return app.withLock(func() int {
+		rep, err := app.apply(ctx, repo, node, &f, rev)
+		if err != nil {
+			return app.errf("%v", err)
+		}
+		return app.emit(rep, &f, false)
+	})
 }
 
 func runAgent(app *App, args []string) int {
@@ -192,6 +229,7 @@ func runAgent(app *App, args []string) int {
 	once := fs.Bool("once", false, "reconcile once and exit")
 	selfHeal := fs.Bool("self-heal", true, "reapply on drift; when false, drift is only reported")
 	depth := fs.Int("depth", 1, "clone depth; 0 for full history")
+	metricsPath := fs.String("metrics", paths.MetricsFile, "write Prometheus textfile metrics here; empty disables")
 	if err := fs.Parse(args); err != nil {
 		return ExitError
 	}
@@ -233,22 +271,49 @@ func runAgent(app *App, args []string) int {
 			period = d
 		}
 
+		// A paused host is still observed and still reports drift; it is just
+		// not converged. Stopping the agent instead would hide the drift as
+		// well, which is the opposite of what an incident needs.
+		pauseRec, paused := readPause(app.Host)
 		dryRun := !*selfHeal && !repo.Config.SelfHeal
-		rep, err := engine.Reconcile(ctx, engine.Options{
-			Repo:         repo,
-			Host:         app.Host,
-			Node:         node,
-			DryRun:       dryRun,
-			Prune:        resolvePrune(repo.Config, &f),
-			Revision:     rev,
-			Only:         f.only,
-			Store:        state.New(app.Host),
-			HealthChecks: f.health,
+		if paused {
+			dryRun = true
+			if iteration == 0 || iteration%12 == 0 {
+				fmt.Fprintf(app.Stderr, "systemcd: reconciliation is paused (%s); reporting drift without converging\n", pauseRec.Reason)
+			}
+		}
+		opts := engine.Options{
+			Repo:               repo,
+			Host:               app.Host,
+			Node:               node,
+			DryRun:             dryRun,
+			Prune:              resolvePrune(repo.Config, &f),
+			Revision:           rev,
+			Only:               f.only,
+			Store:              app.storeFor(),
+			HealthChecks:       f.health,
+			ConfirmDestructive: f.confirm,
+		}
+
+		// The lock is taken per iteration rather than for the agent's
+		// lifetime, so an operator can still run `systemcd apply` by hand
+		// between passes instead of being locked out by the daemon.
+		var rep *engine.Report
+		lockErr := app.lockedRun(dryRun, func() error {
+			var err error
+			rep, err = engine.Reconcile(ctx, opts)
+			return err
 		})
-		if err != nil {
-			fmt.Fprintf(app.Stderr, "systemcd: reconcile failed: %v\n", err)
+		if lockErr != nil {
+			fmt.Fprintf(app.Stderr, "systemcd: reconcile failed: %v\n", lockErr)
+			err = lockErr
 		} else {
 			app.logIteration(rep, &f)
+			if *metricsPath != "" {
+				if writeErr := metrics.Write(app.Host, *metricsPath, rep, paused); writeErr != nil {
+					fmt.Fprintf(app.Stderr, "systemcd: could not write metrics: %v\n", writeErr)
+				}
+			}
 		}
 
 		if *once {
@@ -278,7 +343,7 @@ func runRollback(app *App, args []string) int {
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	store := state.New(app.Host)
+	store := app.storeFor()
 	snap, err := store.Load()
 	if err != nil {
 		return app.errf("%v", err)
@@ -305,11 +370,13 @@ func runRollback(app *App, args []string) int {
 	if err != nil {
 		return app.errf("%v", err)
 	}
-	rep, err := app.apply(ctx, repo, node, &f, target)
-	if err != nil {
-		return app.errf("%v", err)
-	}
-	return app.emit(rep, &f, false)
+	return app.withLock(func() int {
+		rep, err := app.apply(ctx, repo, node, &f, target)
+		if err != nil {
+			return app.errf("%v", err)
+		}
+		return app.emit(rep, &f, false)
+	})
 }
 
 // apply runs a real reconcile with health checks enabled.
@@ -319,16 +386,17 @@ func (app *App) apply(ctx context.Context, repo *manifest.Repository, node manif
 		logf = func(format string, args ...any) { fmt.Fprintf(app.Stderr, format+"\n", args...) }
 	}
 	return engine.Reconcile(ctx, engine.Options{
-		Repo:         repo,
-		Host:         app.Host,
-		Node:         node,
-		DryRun:       false,
-		Prune:        resolvePrune(repo.Config, f),
-		Revision:     revision,
-		Only:         f.only,
-		Store:        state.New(app.Host),
-		Logf:         logf,
-		HealthChecks: f.health,
+		Repo:               repo,
+		Host:               app.Host,
+		Node:               node,
+		DryRun:             false,
+		Prune:              resolvePrune(repo.Config, f),
+		Revision:           revision,
+		Only:               f.only,
+		Store:              app.storeFor(),
+		Logf:               logf,
+		HealthChecks:       f.health,
+		ConfirmDestructive: f.confirm,
 	})
 }
 
@@ -367,9 +435,10 @@ func (app *App) revision(ctx context.Context, root string) string {
 
 func (app *App) reportOptions(f *commonFlags) report.Options {
 	return report.Options{
-		Color:    !f.noColor && report.DetectColor(app.Stdout),
-		Verbose:  f.verbose,
-		ShowDiff: true,
+		Color:         !f.noColor && report.DetectColor(app.Stdout),
+		Verbose:       f.verbose,
+		ShowDiff:      true,
+		NoContentDiff: f.noContentDiff,
 	}
 }
 

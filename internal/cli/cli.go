@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/vikki8/systemcd/internal/manifest"
 	"github.com/vikki8/systemcd/internal/paths"
 	"github.com/vikki8/systemcd/internal/resource"
+	"github.com/vikki8/systemcd/internal/state"
 	"gopkg.in/yaml.v3"
 )
 
@@ -52,6 +54,14 @@ func commands() []command {
 		{"agent", "run the reconcile loop continuously", runAgent},
 		{"rollback", "reapply the previously applied revision", runRollback},
 		{"validate", "check manifests without contacting the host", runValidate},
+		{"inventory", "discover configuration this host has that systemcd does not manage", runInventory},
+		{"adopt", "take ownership of existing resources without changing them", runAdopt},
+		{"release", "hand ownership back, preserving or restoring the host", runRelease},
+		{"pause", "stop the agent converging this host, without stopping it", runPause},
+		{"resume", "let the agent converge this host again", runResume},
+		{"show", "show systemcd's ownership record for a resource", runShow},
+		{"owns", "report which resource owns a path, unit, package or account", runOwns},
+		{"capabilities", "report what systemcd can guarantee on this host", runCapabilities},
 		{"install", "install systemcd's own systemd unit", runInstall},
 		{"kinds", "list supported resource kinds", runKinds},
 		{"version", "print the version", runVersion},
@@ -100,7 +110,7 @@ Usage:
 Commands:
 `)
 	for _, c := range commands() {
-		fmt.Fprintf(app.Stdout, "  %-10s %s\n", c.name, c.summary)
+		fmt.Fprintf(app.Stdout, "  %-13s %s\n", c.name, c.summary)
 	}
 	fmt.Fprintf(app.Stdout, `
 Run "systemcd <command> -h" for the flags of a command.
@@ -129,6 +139,10 @@ type commonFlags struct {
 	labels   stringList
 	hostname string
 	health   bool
+	confirm  bool
+	// noContentDiff hides the unified text diff of file contents, which is
+	// useful when plan output is being piped somewhere narrow.
+	noContentDiff bool
 }
 
 func (f *commonFlags) register(fs *flag.FlagSet, withPrune bool) {
@@ -140,10 +154,43 @@ func (f *commonFlags) register(fs *flag.FlagSet, withPrune bool) {
 	fs.Var(&f.labels, "label", "node label as key=value, for host targeting; repeatable")
 	fs.StringVar(&f.hostname, "hostname", "", "override the detected hostname for targeting")
 	fs.BoolVar(&f.health, "health", true, "run post-apply health checks")
+	fs.BoolVar(&f.noContentDiff, "no-content-diff", false, "show checksums instead of the lines that changed inside files")
 	if withPrune {
 		fs.BoolVar(&f.prune, "prune", false, "delete resources removed from the repository")
 		fs.BoolVar(&f.noPrune, "no-prune", false, "never prune, overriding the repo config")
+		fs.BoolVar(&f.confirm, "confirm", false, "allow pruning packages, accounts and directory trees, which systemcd cannot undo")
 	}
+}
+
+// storeFor builds a state store that reports recoverable problems rather than
+// swallowing them.
+func (app *App) storeFor() *state.Store {
+	store := state.New(app.Host)
+	store.Warnf = func(format string, args ...any) {
+		fmt.Fprintf(app.Stderr, "systemcd: "+format+"\n", args...)
+	}
+	return store
+}
+
+// withLock serializes host mutation. A hand-run `systemcd apply` and the
+// agent's loop converging the same machine at the same time would interleave
+// their writes and clobber each other's ownership records, so the second one
+// is turned away with an explanation instead of racing.
+func (app *App) withLock(fn func() int) int {
+	unlock, err := app.storeFor().Lock()
+	if errors.Is(err, host.ErrLocked) {
+		return app.errf("another systemcd process is reconciling this host (lock: %s).\n"+
+			"        Wait for it to finish, or check `systemctl status systemcd` if the agent is running.", paths.LockFile)
+	}
+	if err != nil {
+		return app.errf("could not take the reconcile lock: %v", err)
+	}
+	defer func() {
+		if err := unlock(); err != nil {
+			fmt.Fprintf(app.Stderr, "systemcd: releasing the lock failed: %v\n", err)
+		}
+	}()
+	return fn()
 }
 
 // stringList collects a repeatable flag.
@@ -250,4 +297,22 @@ func (app *App) warnIfNotRoot() {
 // reconciles instead of being killed mid-apply.
 func signalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// lockedRun runs fn under the reconcile lock, skipping the lock entirely for
+// read-only passes. A busy lock is reported as an ordinary error so the agent
+// can log it and try again next tick rather than dying.
+func (app *App) lockedRun(readOnly bool, fn func() error) error {
+	if readOnly {
+		return fn()
+	}
+	unlock, err := app.storeFor().Lock()
+	if errors.Is(err, host.ErrLocked) {
+		return fmt.Errorf("another systemcd process holds the reconcile lock (%s); skipping this pass", paths.LockFile)
+	}
+	if err != nil {
+		return fmt.Errorf("could not take the reconcile lock: %w", err)
+	}
+	defer func() { _ = unlock() }()
+	return fn()
 }

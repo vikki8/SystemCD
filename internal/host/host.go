@@ -20,6 +20,9 @@ var ErrNotExist = fs.ErrNotExist
 // ErrUnknownUser is returned when a user or group name cannot be resolved.
 var ErrUnknownUser = errors.New("unknown user or group")
 
+// ErrLocked is returned by TryLock when another process holds the lock.
+var ErrLocked = errors.New("lock held by another process")
+
 // Result captures the outcome of a command execution.
 type Result struct {
 	Stdout   string
@@ -56,8 +59,17 @@ type Host interface {
 	// LookPath reports whether an executable is available on PATH.
 	LookPath(name string) (string, error)
 
+	// TryLock takes an exclusive, non-blocking lock on a path. It returns
+	// ErrLocked when another process already holds it. The returned function
+	// releases the lock.
+	TryLock(path string) (func() error, error)
+
 	ReadFile(path string) ([]byte, error)
 	WriteFile(path string, data []byte, mode fs.FileMode) error
+	// WriteFileSync is WriteFile plus an fsync of the containing directory,
+	// so the rename that publishes the file survives a power loss. Used for
+	// state, where a torn write costs the operator their ownership records.
+	WriteFileSync(path string, data []byte, mode fs.FileMode) error
 	Stat(path string) (FileInfo, error)
 	ReadDir(path string) ([]string, error)
 	MkdirAll(path string, mode fs.FileMode) error

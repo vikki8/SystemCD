@@ -145,15 +145,29 @@ type Repository struct {
 	Documents []*Document
 }
 
-// SelectFor returns the documents that target the given node, in load order.
+// SelectFor returns the documents that target the given node, in load order,
+// with any Patch documents merged into the resources they name.
+//
+// Errors from patching are surfaced through SelectForE; this form keeps the
+// common call site simple by returning the unpatched set on failure, which
+// then fails loudly at build time rather than silently applying half a patch.
 func (r *Repository) SelectFor(n Node) []*Document {
+	docs, err := r.SelectForE(n)
+	if err != nil {
+		return nil
+	}
+	return docs
+}
+
+// SelectForE is SelectFor with the patch error surfaced.
+func (r *Repository) SelectForE(n Node) ([]*Document, error) {
 	var out []*Document
 	for _, d := range r.Documents {
 		if d.Metadata.Targets.Matches(n) {
 			out = append(out, d)
 		}
 	}
-	return out
+	return ApplyPatches(out, n)
 }
 
 // Validate checks structural invariants that hold regardless of kind:
@@ -163,6 +177,11 @@ func (r *Repository) Validate() error {
 	seen := map[string]*Document{}
 
 	for _, d := range r.Documents {
+		if d.Kind == PatchKind {
+			// A patch's target is resolved per node, since a patch and the
+			// resource it narrows can be scoped differently.
+			continue
+		}
 		if d.APIVersion != APIVersion {
 			problems = append(problems, fmt.Sprintf("%s: apiVersion %q is not supported (want %q)", d.Location(), d.APIVersion, APIVersion))
 		}

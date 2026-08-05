@@ -43,6 +43,7 @@ type CommandStub struct {
 type MemHost struct {
 	mu    sync.Mutex
 	files map[string]*memFile
+	locks map[string]bool
 
 	// Users and Groups map names to ids. Unlisted names fail to resolve.
 	Users  map[string]int
@@ -166,6 +167,32 @@ func (m *MemHost) ReadFile(p string) ([]byte, error) {
 	out := make([]byte, len(f.data))
 	copy(out, f.data)
 	return out, nil
+}
+
+// TryLock models flock within the process, which is enough to exercise the
+// "another apply is already running" path in tests.
+func (m *MemHost) TryLock(p string) (func() error, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.locks == nil {
+		m.locks = map[string]bool{}
+	}
+	cp := clean(p)
+	if m.locks[cp] {
+		return nil, ErrLocked
+	}
+	m.locks[cp] = true
+	return func() error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		delete(m.locks, cp)
+		return nil
+	}, nil
+}
+
+// WriteFileSync has no separate durability story in memory.
+func (m *MemHost) WriteFileSync(p string, data []byte, mode fs.FileMode) error {
+	return m.WriteFile(p, data, mode)
 }
 
 func (m *MemHost) WriteFile(p string, data []byte, mode fs.FileMode) error {

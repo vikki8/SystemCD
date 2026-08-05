@@ -7,6 +7,7 @@ spec:
   # Where manifests live. Omit to load the whole repository.
   paths:
     - manifests
+    - patches
 
   # Delete resources that used to be in this repo but are no longer declared.
   # Off by default: turning it on means removing a file from git removes it

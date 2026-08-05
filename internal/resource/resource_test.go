@@ -628,3 +628,221 @@ func TestCompareMarksSensitiveFields(t *testing.T) {
 		t.Fatalf("diff = %+v, want one sensitive field", d)
 	}
 }
+
+func TestUserGroupsAdditiveIsTheDefault(t *testing.T) {
+	// `groups: [docker]` means "must be in docker", not "owns the group
+	// list". The dangerous reading must never be the accidental one.
+	h := host.NewMem()
+	h.AddStub(host.CommandStub{Match: "getent passwd deploy", Stdout: "deploy:x:997:997::/var/lib/deploy:/usr/sbin/nologin"})
+	h.AddStub(host.CommandStub{Match: "id -nG deploy", Stdout: "deploy docker sudo systemd-journal"})
+	c := newContext(h)
+
+	r := buildFrom(t, `
+apiVersion: systemcd.dev/v1
+kind: User
+metadata:
+  name: deploy
+spec:
+  groups: [docker]
+`)
+	assertConverged(t, r, c)
+}
+
+func TestUserGroupsExactTreatsExtraMembershipAsDrift(t *testing.T) {
+	h := host.NewMem()
+	h.AddStub(host.CommandStub{Match: "getent passwd deploy", Stdout: "deploy:x:997:997::/var/lib/deploy:/usr/sbin/nologin"})
+	h.AddStub(host.CommandStub{Match: "getent group 997", Stdout: "deploy:x:997:"})
+	h.AddStub(host.CommandStub{Match: "id -nG deploy", Stdout: "deploy docker sudo"})
+	c := newContext(h)
+
+	r := buildFrom(t, `
+apiVersion: systemcd.dev/v1
+kind: User
+metadata:
+  name: deploy
+spec:
+  groups:
+    ensure: [docker]
+    mode: exact
+`)
+	d := converge(t, r, c)
+	if !d.Has("groups") {
+		t.Fatalf("exact mode should report the extra sudo membership as drift, got %+v", d)
+	}
+	if want, _ := d.Want("groups"); want != "docker" {
+		t.Errorf("desired groups = %q, want just docker", want)
+	}
+	// The primary group is excluded: usermod --groups does not manage it, so
+	// reporting it would be permanent, unfixable drift.
+	have := d[0].Have
+	if !strings.Contains(have, "sudo") || strings.Contains(have, "deploy") {
+		t.Errorf("observed groups = %q, want the supplementary groups without the primary", have)
+	}
+	// Without --append, usermod sets the list exactly.
+	if !h.Ran("usermod --groups docker deploy") {
+		t.Errorf("commands = %v", h.Commands)
+	}
+	if h.Ran("--append") {
+		t.Errorf("exact mode must not use --append; commands = %v", h.Commands)
+	}
+}
+
+func TestUserGroupsExactRejectsAnEmptyList(t *testing.T) {
+	err := buildErr(t, `
+apiVersion: systemcd.dev/v1
+kind: User
+metadata:
+  name: deploy
+spec:
+  groups:
+    mode: exact
+`)
+	if err == nil || !strings.Contains(err.Error(), "remove every supplementary group") {
+		t.Fatalf("error = %v, want a refusal to interpret an empty exact list", err)
+	}
+}
+
+func TestUserGroupsRejectsAnUnknownMode(t *testing.T) {
+	err := buildErr(t, `
+apiVersion: systemcd.dev/v1
+kind: User
+metadata:
+  name: deploy
+spec:
+  groups:
+    ensure: [docker]
+    mode: whatever
+`)
+	if err == nil || !strings.Contains(err.Error(), "spec.groups.mode") {
+		t.Fatalf("error = %v, want a mode validation failure", err)
+	}
+}
+
+func TestPackageVersionIsRefusedWhereItCannotBeGuaranteed(t *testing.T) {
+	// Accepting a field that cannot converge would break the core promise.
+	// Better to say so than to report permanent drift forever.
+	for _, mgr := range []string{"apk", "pacman"} {
+		t.Run(mgr, func(t *testing.T) {
+			h := host.NewMem()
+			h.Binaries[mgr] = true
+			c := newContext(h)
+
+			r := buildFrom(t, `
+apiVersion: systemcd.dev/v1
+kind: Package
+metadata:
+  name: nginx
+spec:
+  version: "1.26.0-r0"
+`)
+			_, err := r.Observe(c)
+			if err == nil {
+				t.Fatal("want a refusal, got nil")
+			}
+			if !strings.Contains(err.Error(), "spec.version is not supported") || !strings.Contains(err.Error(), mgr) {
+				t.Errorf("error should name the manager and the limitation, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestPackageVersionIsAcceptedWhereItCanBeGuaranteed(t *testing.T) {
+	for _, tc := range []struct{ mgr, binary string }{
+		{"apt", "apt-get"}, {"dnf", "dnf"}, {"yum", "yum"}, {"zypper", "zypper"},
+	} {
+		t.Run(tc.mgr, func(t *testing.T) {
+			h := host.NewMem()
+			h.Binaries[tc.binary] = true
+			h.AddStub(host.CommandStub{Match: "dpkg-query", Stdout: "installed 1.2.3"})
+			h.AddStub(host.CommandStub{Match: "rpm -q", Stdout: "1.2.3"})
+			c := newContext(h)
+
+			r := buildFrom(t, `
+apiVersion: systemcd.dev/v1
+kind: Package
+metadata:
+  name: nginx
+spec:
+  version: "1.2.3"
+`)
+			if _, err := r.Observe(c); err != nil {
+				t.Fatalf("observe: %v", err)
+			}
+		})
+	}
+}
+
+func TestCapabilitiesReportWhatTheHostCanGuarantee(t *testing.T) {
+	h := host.NewMem()
+	h.Binaries["apk"] = true
+	caps, err := DetectCapabilities(newContext(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caps.Manager != "apk" || caps.VersionPinning {
+		t.Errorf("capabilities = %+v, want apk without version pinning", caps)
+	}
+	if caps.Note == "" {
+		t.Error("an unsupported capability should come with a reason")
+	}
+
+	h2 := host.NewMem()
+	h2.Binaries["apt-get"] = true
+	caps2, err := DetectCapabilities(newContext(h2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caps2.VersionPinning {
+		t.Errorf("capabilities = %+v, want apt with version pinning", caps2)
+	}
+}
+
+func TestClaimsAreDeclaredForEveryOwningKind(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{"kind: File\nmetadata:\n  name: a\nspec:\n  path: /etc/a\n", "path:/etc/a"},
+		{"kind: Directory\nmetadata:\n  name: a\nspec:\n  path: /opt/a\n", "path:/opt/a"},
+		{"kind: Service\nmetadata:\n  name: nginx\n", "unit:nginx.service"},
+		{"kind: SystemdUnit\nmetadata:\n  name: app\nspec:\n  content: \"x\"\n", "path:/etc/systemd/system/app.service"},
+		{"kind: Package\nmetadata:\n  name: nginx\n", "package:nginx"},
+		{"kind: User\nmetadata:\n  name: deploy\n", "user:deploy"},
+		{"kind: Group\nmetadata:\n  name: deploy\n", "group:deploy"},
+		{"kind: Sysctl\nmetadata:\n  name: fwd\nspec:\n  key: net.ipv4.ip_forward\n  value: \"1\"\n", "sysctl:net.ipv4.ip_forward"},
+	}
+	for _, tc := range cases {
+		r := buildFrom(t, "apiVersion: systemcd.dev/v1\n"+tc.src)
+		claims := ClaimStrings(ClaimsOf(r))
+		if len(claims) == 0 {
+			t.Errorf("%s declares no claims", r.ID())
+			continue
+		}
+		found := false
+		for _, c := range claims {
+			if c == tc.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s claims = %v, want it to include %q", r.ID(), claims, tc.want)
+		}
+	}
+}
+
+func TestExecClaimsNothing(t *testing.T) {
+	// An Exec cannot say what it owns, which is exactly why it is the escape
+	// hatch and why it needs a guard.
+	r := buildFrom(t, `
+apiVersion: systemcd.dev/v1
+kind: Exec
+metadata:
+  name: thing
+spec:
+  command: /bin/true
+  creates: /tmp/x
+`)
+	if claims := ClaimsOf(r); len(claims) != 0 {
+		t.Errorf("Exec claims = %v, want none", claims)
+	}
+}
