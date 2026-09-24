@@ -62,14 +62,19 @@ func buildFile(doc *manifest.Document) (Resource, error) {
 func (f *File) ID() ID { return ID{Kind: "File", Name: f.name} }
 
 func (f *File) Validate() error {
-	if f.spec.Path == "" {
-		return errors.New("spec.path is required")
+	p, err := cleanAbsPath(f.spec.Path)
+	if err != nil {
+		return err
 	}
-	if !strings.HasPrefix(f.spec.Path, "/") {
-		return fmt.Errorf("spec.path %q must be absolute", f.spec.Path)
+	if p == "/" {
+		return errors.New("spec.path must name a file, not /")
 	}
+	f.spec.Path = p
 	if f.spec.Content != "" && f.spec.Source != "" {
 		return errors.New("spec.content and spec.source are mutually exclusive")
+	}
+	if f.spec.Source != "" && !filepath.IsLocal(f.spec.Source) {
+		return fmt.Errorf("spec.source %q must be a relative path inside the repository", f.spec.Source)
 	}
 	state, err := normalizePresence(f.spec.State)
 	if err != nil {
@@ -95,7 +100,10 @@ func (f *File) SensitiveFields() map[string]bool {
 // content returns the bytes the file should contain.
 func (f *File) content(c *Context) ([]byte, error) {
 	if f.spec.Source != "" {
-		p := filepath.Join(c.RepoRoot, filepath.Clean("/"+f.spec.Source))
+		p, err := repoPath(c.RepoRoot, f.spec.Source)
+		if err != nil {
+			return nil, fmt.Errorf("spec.source %q: %w", f.spec.Source, err)
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
 			return nil, fmt.Errorf("spec.source %q: %w", f.spec.Source, err)
@@ -103,6 +111,31 @@ func (f *File) content(c *Context) ([]byte, error) {
 		return data, nil
 	}
 	return []byte(f.spec.Content), nil
+}
+
+// repoPath resolves a manifest-relative asset path inside the repository.
+// A symlink committed to the repository is followed only as far as the
+// repository root: a payload that resolves to /etc/shadow would otherwise be
+// copied onto the host and printed in plan diffs.
+func repoPath(root, rel string) (string, error) {
+	if root == "" {
+		return "", errors.New("no repository root to resolve it against")
+	}
+	if !filepath.IsLocal(rel) {
+		return "", errors.New("must be a relative path inside the repository")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	p, err := filepath.EvalSymlinks(filepath.Join(realRoot, rel))
+	if err != nil {
+		return "", err
+	}
+	if inside, err := filepath.Rel(realRoot, p); err != nil || !filepath.IsLocal(inside) {
+		return "", errors.New("resolves outside the repository")
+	}
+	return p, nil
 }
 
 func (f *File) Desired(c *Context) (State, error) {
@@ -137,6 +170,13 @@ func (f *File) Observe(c *Context) (State, error) {
 	if info.IsDir {
 		return nil, fmt.Errorf("%s exists but is a directory", f.spec.Path)
 	}
+	if info.Target != "" {
+		// A symlink is not the file the manifest describes. Reading through
+		// it would report (and chmod, and print in a diff) whatever it points
+		// at, and its lstat mode is always 0777, so it could never converge.
+		// Reporting it as its own state makes Apply replace the link.
+		return State{"state": stateSymlink, "_path": f.spec.Path, "_target": info.Target}, nil
+	}
 
 	s := State{"state": Present, "_path": f.spec.Path, "mode": modeString(info.Mode)}
 	data, err := c.Host.ReadFile(f.spec.Path)
@@ -144,21 +184,34 @@ func (f *File) Observe(c *Context) (State, error) {
 		return nil, err
 	}
 	s["checksum"] = checksum(data)
-	if name, err := c.Host.LookupUserName(info.UID); err == nil {
+	if name, ok := observedOwner(c, info.UID, f.spec.Owner); ok {
 		s["owner"] = name
 	}
-	if name, err := c.Host.LookupGroupName(info.GID); err == nil {
+	if name, ok := observedGroup(c, info.GID, f.spec.Group); ok {
 		s["group"] = name
 	}
 	s["_bytes"] = strconv.FormatInt(info.Size, 10)
 	return s, nil
 }
 
+// stateSymlink is what File reports when its path holds a symbolic link
+// rather than a regular file.
+const stateSymlink = "symlink"
+
 func (f *File) Apply(c *Context, d Diff) error {
 	if f.spec.State == Absent {
 		return f.Delete(c)
 	}
-	if d.Has("state") || d.Has("checksum") {
+	written := d.Has("state") || d.Has("checksum")
+	// Writing replaces the file with a new one owned by systemcd, so whichever
+	// of owner and group the manifest leaves unmanaged has to be carried over
+	// from the file being replaced, or a www-data config silently becomes
+	// root-only on its first content change.
+	keepUID, keepGID := -1, -1
+	if written {
+		if info, err := c.Host.Stat(f.spec.Path); err == nil && !info.IsDir && info.Target == "" {
+			keepUID, keepGID = info.UID, info.GID
+		}
 		data, err := f.content(c)
 		if err != nil {
 			return err
@@ -173,15 +226,27 @@ func (f *File) Apply(c *Context, d Diff) error {
 		}
 		c.Log("wrote %s (%d bytes)", f.spec.Path, len(data))
 	}
-	if d.Has("mode") || d.Has("state") {
+	// WriteFile already set the mode on the new file before publishing it. A
+	// second chmod by path would follow a symlink swapped in after the rename.
+	if d.Has("mode") && !written {
 		if err := c.Host.Chmod(f.spec.Path, f.mode); err != nil {
 			return err
 		}
 	}
-	return applyOwnership(c, f.spec.Path, f.spec.Owner, f.spec.Group, d)
+	return applyOwnership(c, f.spec.Path, f.spec.Owner, f.spec.Group, d, keepUID, keepGID)
 }
 
 func (f *File) Delete(c *Context) error {
+	info, err := c.Host.Stat(f.spec.Path)
+	if errors.Is(err, host.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir {
+		return fmt.Errorf("%s exists but is a directory; a File resource will not remove it", f.spec.Path)
+	}
 	// Back up before removing, not just before overwriting: a delete is the
 	// one operation with nothing left to recover from afterwards.
 	if f.backupEnabled() {
@@ -189,7 +254,7 @@ func (f *File) Delete(c *Context) error {
 			return err
 		}
 	}
-	err := c.Host.Remove(f.spec.Path)
+	err = c.Host.Remove(f.spec.Path)
 	if errors.Is(err, host.ErrNotExist) {
 		return nil
 	}
@@ -235,17 +300,19 @@ func buildDirectory(doc *manifest.Document) (Resource, error) {
 func (d *Directory) ID() ID { return ID{Kind: "Directory", Name: d.name} }
 
 func (d *Directory) Validate() error {
-	if d.spec.Path == "" {
-		return errors.New("spec.path is required")
+	p, err := cleanAbsPath(d.spec.Path)
+	if err != nil {
+		return err
 	}
-	if !strings.HasPrefix(d.spec.Path, "/") {
-		return fmt.Errorf("spec.path %q must be absolute", d.spec.Path)
-	}
+	d.spec.Path = p
 	state, err := normalizePresence(d.spec.State)
 	if err != nil {
 		return err
 	}
 	d.spec.State = state
+	if p == "/" && (state == Absent || d.spec.Recursive) {
+		return errors.New("spec.path / cannot be removed; refusing `state: absent` or `recursive: true` on it")
+	}
 	mode, err := parseMode(d.spec.Mode, 0o755)
 	if err != nil {
 		return err
@@ -281,10 +348,10 @@ func (d *Directory) Observe(c *Context) (State, error) {
 		return nil, fmt.Errorf("%s exists but is not a directory", d.spec.Path)
 	}
 	s := State{"state": Present, "_path": d.spec.Path, "mode": modeString(info.Mode)}
-	if name, err := c.Host.LookupUserName(info.UID); err == nil {
+	if name, ok := observedOwner(c, info.UID, d.spec.Owner); ok {
 		s["owner"] = name
 	}
-	if name, err := c.Host.LookupGroupName(info.GID); err == nil {
+	if name, ok := observedGroup(c, info.GID, d.spec.Group); ok {
 		s["group"] = name
 	}
 	return s, nil
@@ -295,6 +362,11 @@ func (d *Directory) Apply(c *Context, diff Diff) error {
 		return d.Delete(c)
 	}
 	if diff.Has("state") {
+		// MkdirAll gives every directory it creates the same mode, so a 0700
+		// leaf would otherwise make its missing parents untraversable too.
+		if err := c.Host.MkdirAll(filepath.Dir(d.spec.Path), 0o755); err != nil {
+			return err
+		}
 		if err := c.Host.MkdirAll(d.spec.Path, d.mode); err != nil {
 			return err
 		}
@@ -305,11 +377,26 @@ func (d *Directory) Apply(c *Context, diff Diff) error {
 			return err
 		}
 	}
-	return applyOwnership(c, d.spec.Path, d.spec.Owner, d.spec.Group, diff)
+	return applyOwnership(c, d.spec.Path, d.spec.Owner, d.spec.Group, diff, -1, -1)
 }
 
 func (d *Directory) Delete(c *Context) error {
-	var err error
+	if d.spec.Path == "/" {
+		return errors.New("refusing to remove /")
+	}
+	info, err := c.Host.Stat(d.spec.Path)
+	if errors.Is(err, host.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir {
+		// Prune reaches here without an Observe. Whatever now sits at the
+		// path is not the directory systemcd managed, and removing it would
+		// take a file (or a symlink) with no backup.
+		return fmt.Errorf("%s exists but is not a directory; a Directory resource will not remove it", d.spec.Path)
+	}
 	if d.spec.Recursive {
 		err = c.Host.RemoveAll(d.spec.Path)
 	} else {
@@ -322,14 +409,18 @@ func (d *Directory) Delete(c *Context) error {
 }
 
 // applyOwnership resolves owner/group names and chowns when either differs.
-func applyOwnership(c *Context, path, owner, group string, d Diff) error {
-	if owner == "" && group == "" {
+// keepUID and keepGID (-1 for none) are the ids of a file that was just
+// replaced; they are put back for whichever of owner and group the manifest
+// does not manage.
+func applyOwnership(c *Context, path, owner, group string, d Diff, keepUID, keepGID int) error {
+	replaced := keepUID != -1 || keepGID != -1
+	if owner == "" && group == "" && !replaced {
 		return nil
 	}
-	if !d.Has("owner") && !d.Has("group") && !d.Has("state") && !d.Has("checksum") {
+	if !replaced && !d.Has("owner") && !d.Has("group") && !d.Has("state") && !d.Has("checksum") {
 		return nil
 	}
-	uid, gid := -1, -1
+	uid, gid := keepUID, keepGID
 	if owner != "" {
 		id, err := c.Host.LookupUID(owner)
 		if err != nil {
@@ -347,9 +438,59 @@ func applyOwnership(c *Context, path, owner, group string, d Diff) error {
 	return c.Host.Chown(path, uid, gid)
 }
 
+// observedOwner renders a file's uid for comparison with the manifest. When
+// the manifest's owner resolves to that same uid it is reported verbatim, so
+// `owner: "33"` or a second name for the same uid is not permanent drift
+// against the name the account database happens to list first.
+func observedOwner(c *Context, uid int, want string) (string, bool) {
+	if want != "" {
+		if id, err := c.Host.LookupUID(want); err == nil && id == uid {
+			return want, true
+		}
+	}
+	name, err := c.Host.LookupUserName(uid)
+	return name, err == nil
+}
+
+// observedGroup is observedOwner for the group.
+func observedGroup(c *Context, gid int, want string) (string, bool) {
+	if want != "" {
+		if id, err := c.Host.LookupGID(want); err == nil && id == gid {
+			return want, true
+		}
+	}
+	name, err := c.Host.LookupGroupName(gid)
+	return name, err == nil
+}
+
+// cleanAbsPath validates spec.path and returns it in canonical form, so
+// /etc/x, /etc//x and /etc/./x are one path to claims and to the host.
+func cleanAbsPath(p string) (string, error) {
+	if p == "" {
+		return "", errors.New("spec.path is required")
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("spec.path %q must be absolute", p)
+	}
+	return filepath.Clean(p), nil
+}
+
 // backupExisting copies the current contents of path into the backup
 // directory before it is overwritten.
 func backupExisting(c *Context, path string) error {
+	info, err := c.Host.Stat(path)
+	if errors.Is(err, host.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Target != "" {
+		// A symlink's contents belong to whatever it points at, which
+		// replacing or removing the link leaves untouched. Reading through it
+		// could also copy a device or another user's file into the backups.
+		return nil
+	}
 	data, err := c.Host.ReadFile(path)
 	if errors.Is(err, host.ErrNotExist) {
 		return nil
@@ -358,9 +499,22 @@ func backupExisting(c *Context, path string) error {
 		return err
 	}
 	stamp := time.Now().UTC().Format("20060102T150405Z")
-	dest := filepath.Join(paths.BackupDir, strings.ReplaceAll(strings.TrimPrefix(path, "/"), "/", "_")+"."+stamp)
+	base := filepath.Join(paths.BackupDir, strings.ReplaceAll(strings.TrimPrefix(path, "/"), "/", "_")+"."+stamp)
 	if err := c.Host.MkdirAll(paths.BackupDir, 0o700); err != nil {
 		return err
+	}
+	// Two backups in the same second (the same path twice, or /etc/a_b and
+	// /etc/a/b) must not overwrite each other: a backup is the only copy.
+	dest := base
+	for i := 1; ; i++ {
+		_, err := c.Host.Stat(dest)
+		if errors.Is(err, host.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		dest = base + "." + strconv.Itoa(i)
 	}
 	return c.Host.WriteFile(dest, data, 0o600)
 }
@@ -381,6 +535,12 @@ func parseMode(s string, def fs.FileMode) (fs.FileMode, error) {
 	v, err := strconv.ParseUint(strings.TrimPrefix(s, "0o"), 8, 32)
 	if err != nil {
 		return 0, fmt.Errorf("spec.mode %q is not an octal permission string", s)
+	}
+	if v > 0o777 {
+		// fs.FileMode keeps setuid, setgid and sticky outside the low bits,
+		// so "1777" would silently become 0777: a world-writable directory
+		// without the sticky bit, reported as in sync.
+		return 0, fmt.Errorf("spec.mode %q: setuid, setgid and sticky bits are not supported; use a mode no higher than 0777", s)
 	}
 	return fs.FileMode(v).Perm(), nil
 }

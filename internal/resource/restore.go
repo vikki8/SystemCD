@@ -56,6 +56,19 @@ var (
 func (f *File) NeedsBaseline() bool { return true }
 
 func (f *File) CaptureBaseline(c *Context) ([]byte, error) {
+	info, err := c.Host.Stat(f.spec.Path)
+	if errors.Is(err, host.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Target != "" {
+		// What a symlink "contains" is where it points. Reading through it
+		// would preserve someone else's file, and a later restore would write
+		// those bytes back with the link's 0777 mode.
+		return []byte(info.Target), nil
+	}
 	data, err := c.Host.ReadFile(f.spec.Path)
 	if errors.Is(err, host.ErrNotExist) {
 		return nil, nil
@@ -76,6 +89,20 @@ func (f *File) Restore(c *Context, prior State, blob []byte) error {
 		}
 		return err
 	}
+	if prior["state"] == stateSymlink {
+		target := string(blob)
+		if target == "" {
+			target = prior["_target"]
+		}
+		if target == "" {
+			return fmt.Errorf("no symlink target was captured for %s", f.spec.Path)
+		}
+		if err := c.Host.Symlink(target, f.spec.Path); err != nil {
+			return err
+		}
+		c.Log("restored %s as a symlink to %s", f.spec.Path, target)
+		return nil
+	}
 	if blob == nil {
 		return fmt.Errorf("no baseline contents were captured for %s", f.spec.Path)
 	}
@@ -88,10 +115,9 @@ func (f *File) Restore(c *Context, prior State, blob []byte) error {
 		}
 		mode = parsed
 	}
+	// WriteFile sets the mode on the new file before publishing it; a chmod
+	// by path afterwards would follow a symlink swapped in after the rename.
 	if err := c.Host.WriteFile(f.spec.Path, blob, mode); err != nil {
-		return err
-	}
-	if err := c.Host.Chmod(f.spec.Path, mode); err != nil {
 		return err
 	}
 	c.Log("restored %s to its pre-adoption contents (%d bytes)", f.spec.Path, len(blob))
@@ -152,7 +178,10 @@ var _ Restorer = (*Service)(nil)
 func (s *Service) NeedsBaseline() bool { return false }
 
 func (s *Service) Restore(c *Context, prior State, _ []byte) error {
-	if want, ok := prior["enabled"]; ok {
+	// Observe records both fields whatever the manifest manages, but only a
+	// field systemcd managed can have been changed by it. Restoring the other
+	// would revert an operator's own later start, stop, enable or disable.
+	if want, ok := prior["enabled"]; ok && s.spec.Enabled != nil {
 		verb := "disable"
 		if want == "true" {
 			verb = "enable"
@@ -162,7 +191,7 @@ func (s *Service) Restore(c *Context, prior State, _ []byte) error {
 		}
 		c.Log("systemctl %s %s (pre-adoption state)", verb, s.unit)
 	}
-	if want, ok := prior["active"]; ok {
+	if want, ok := prior["active"]; ok && s.spec.State != serviceUnmanaged {
 		verb := "stop"
 		if want == "active" {
 			verb = "start"
@@ -258,6 +287,11 @@ func (f *File) ContentDiff(c *Context) (string, string, bool, error) {
 	after, err := f.content(c)
 	if err != nil {
 		return "", "", false, err
+	}
+	// Never read through a symlink: its "before" is someone else's file, and
+	// printing it in a plan would leak whatever the link was pointed at.
+	if info, err := c.Host.Stat(f.spec.Path); err == nil && info.Target != "" {
+		return "", "", false, nil
 	}
 	before, err := c.Host.ReadFile(f.spec.Path)
 	if errors.Is(err, host.ErrNotExist) {
