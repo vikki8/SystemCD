@@ -34,6 +34,13 @@ type graph struct {
 // resource it wakes, otherwise a config change could restart a service before
 // the new config is on disk.
 func build(docs []*manifest.Document) (*graph, error) {
+	return buildFor(docs, nil)
+}
+
+// buildFor is build for a set of documents that need not all target one
+// host. disjoint, when set, reports two documents that can never be selected
+// for the same host; their claims cannot conflict.
+func buildFor(docs []*manifest.Document, disjoint func(a, b *manifest.Document) bool) (*graph, error) {
 	g := &graph{nodes: map[resource.ID]*node{}}
 
 	for i, doc := range docs {
@@ -63,7 +70,7 @@ func build(docs []*manifest.Document) (*graph, error) {
 		g.nodes[id] = n
 	}
 
-	if err := g.checkClaims(); err != nil {
+	if err := g.checkClaims(disjoint); err != nil {
 		return nil, err
 	}
 
@@ -91,12 +98,13 @@ func build(docs []*manifest.Document) (*graph, error) {
 // resources pointing at one path do not "mostly work", they produce a machine
 // whose contents depend on document order, and last-writer-wins is not a
 // property anyone can reason about at 3am.
-func (g *graph) checkClaims() error {
+func (g *graph) checkClaims(disjoint func(a, b *manifest.Document) bool) error {
 	type holder struct {
 		id  resource.ID
 		loc string
+		doc *manifest.Document
 	}
-	owners := map[string]holder{}
+	owners := map[string][]holder{}
 
 	// Sort for a deterministic error message regardless of map iteration.
 	ids := make([]resource.ID, 0, len(g.nodes))
@@ -110,13 +118,20 @@ func (g *graph) checkClaims() error {
 		n := g.nodes[id]
 		for _, claim := range resource.ClaimsOf(n.res) {
 			key := claim.String()
-			if prev, taken := owners[key]; taken {
+			clash := false
+			for _, prev := range owners[key] {
+				if disjoint != nil && disjoint(prev.doc, n.doc) {
+					continue
+				}
 				conflicts = append(conflicts, fmt.Sprintf(
 					"%s and %s both claim %s (declared at %s and %s)",
 					prev.id, id, key, prev.loc, n.doc.Location()))
-				continue
+				clash = true
+				break
 			}
-			owners[key] = holder{id: id, loc: n.doc.Location()}
+			if !clash {
+				owners[key] = append(owners[key], holder{id: id, loc: n.doc.Location(), doc: n.doc})
+			}
 		}
 	}
 	if len(conflicts) > 0 {

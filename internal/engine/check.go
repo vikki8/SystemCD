@@ -63,6 +63,25 @@ func Check(repo *manifest.Repository) error {
 		return fmt.Errorf("invalid repository:\n  - %s", strings.Join(problems, "\n  - "))
 	}
 
-	_, err := build(resources)
+	// Targeting is ignored for everything else, but two resources claiming
+	// one path for hosts that can never overlap (role=web, role=db) plan fine
+	// on every host, so validate must not reject them.
+	_, err := buildFor(resources, labelsDisjoint)
 	return err
+}
+
+// labelsDisjoint reports whether two documents can never select the same
+// host: both require the same label with different values. Hostname globs
+// are not compared, so documents scoped only by them are assumed to overlap.
+func labelsDisjoint(a, b *manifest.Document) bool {
+	ta, tb := a.Metadata.Targets, b.Metadata.Targets
+	if ta == nil || tb == nil {
+		return false
+	}
+	for k, v := range ta.Labels {
+		if w, ok := tb.Labels[k]; ok && w != v {
+			return true
+		}
+	}
+	return false
 }

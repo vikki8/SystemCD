@@ -14,7 +14,6 @@ import (
 	"github.com/vikki8/systemcd/internal/manifest"
 	"github.com/vikki8/systemcd/internal/resource"
 	"github.com/vikki8/systemcd/internal/state"
-	"gopkg.in/yaml.v3"
 )
 
 // Action classifies what a reconcile did (or would do) to a resource.
@@ -97,6 +96,9 @@ type Result struct {
 	observed resource.State
 	// baselinePath points at contents preserved on first adoption.
 	baselinePath string
+	// createdPartly marks a failed create that nevertheless brought the
+	// resource into existence, so it is recorded as systemcd's creation.
+	createdPartly bool
 }
 
 // OutOfSync reports whether the resource differed from the manifest.
@@ -325,8 +327,18 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 	blocked := map[resource.ID]string{}
 	notified := map[resource.ID]bool{}
 	changedThisRun := map[resource.ID]bool{}
+	// Refreshes an earlier run owed but could not deliver. They are due now
+	// exactly as if a notifier had just changed, and stay owed until one is
+	// delivered: by the next run the notifier is in sync and will not ask
+	// again.
+	owed := map[string]bool{}
+	for _, ref := range snap.PendingRefresh {
+		owed[ref] = true
+	}
 
 	for _, n := range g.sorted {
+		ref := n.id.String()
+		due := notified[n.id] || owed[ref]
 		if reason, isBlocked := blocked[n.id]; isBlocked {
 			report.Results = append(report.Results, Result{
 				ID: n.id, Action: ActionSkip, Source: n.doc.Location(),
@@ -334,16 +346,29 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 				Owner:    ownershipOf(snap, n.id),
 			})
 			blockDependents(g, preds, n.id, blocked, fmt.Sprintf("depends on skipped %s", n.id))
+			if due {
+				owed[ref] = true
+			}
 			continue
 		}
 
-		res := rc.reconcileOne(n, notified[n.id], snap)
+		res := rc.reconcileOne(n, due, snap)
+		if owed[ref] && !notified[n.id] {
+			res.Messages = append(res.Messages, "refresh owed since an earlier run that could not deliver it")
+		}
 		report.Results = append(report.Results, res)
 
 		if res.Err != nil {
+			if due {
+				owed[ref] = true
+			}
+			if !opts.DryRun && res.createdPartly {
+				recordState(snap, n, Result{Action: ActionCreate}, opts.Revision)
+			}
 			blockDependents(g, preds, n.id, blocked, fmt.Sprintf("depends on failed %s", n.id))
 			continue
 		}
+		delete(owed, ref)
 		if res.Action.Changed() {
 			changedThisRun[n.id] = true
 			// Notifications propagate during a dry run too, so a plan shows
@@ -351,11 +376,12 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 			for _, target := range n.notifies {
 				notified[target] = true
 			}
-			for _, ref := range n.doc.Notify {
-				if excluded[ref] {
+			for _, target := range n.doc.Notify {
+				if excluded[target] {
+					owed[target] = true
 					report.Notes = append(report.Notes, fmt.Sprintf(
 						"%s is notified by %s but excluded by --only, so this run does not refresh it; "+
-							"include it in --only or refresh it by hand", ref, n.id))
+							"the refresh stays owed until a run that includes it", target, n.id))
 				}
 			}
 		}
@@ -381,6 +407,20 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 	report.Finished = time.Now()
 
 	if !opts.DryRun && opts.Store != nil {
+		// An owed refresh outlives the run only while its target is still
+		// declared for this host; one the repository dropped is owed nothing.
+		declared := map[string]bool{}
+		for _, doc := range selected {
+			declared[doc.Ref()] = true
+		}
+		snap.PendingRefresh = nil
+		for ref := range owed {
+			if declared[ref] {
+				snap.PendingRefresh = append(snap.PendingRefresh, ref)
+			}
+		}
+		sort.Strings(snap.PendingRefresh)
+
 		snap.RecordApply(opts.Revision, report.Counts().Changed)
 		if err := opts.Store.Save(snap); err != nil {
 			return report, fmt.Errorf("save state: %w", err)
@@ -482,6 +522,10 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 	// systemcd edited the machine. Only the second one is an incident.
 	switch {
 	case diff.Empty():
+	case out.Action == ActionRun:
+		// An Exec is due because its guard says so (and an `always: true`
+		// one is due every time). That is not host configuration anyone
+		// changed, so it is neither repository nor external drift.
 	case moved:
 		out.Owner.Origin = state.OriginRepo
 	case owned:
@@ -518,6 +562,14 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 
 	if !diff.Empty() {
 		if err := n.res.Apply(rc.resource, diff); err != nil {
+			// A create that fails partway (written, then the chown fails) can
+			// leave the new thing behind. Unrecorded, the next run would take
+			// it for something that already existed and adopt it, with
+			// systemcd's own bytes as the "original".
+			if (!owned || moved) && out.Action == ActionCreate {
+				after, oerr := n.res.Observe(rc.resource)
+				out.createdPartly = oerr == nil && classify(resource.Compare(desired, after, nil)) != ActionCreate
+			}
 			out.Action, out.Err = ActionError, err
 			return out
 		}
@@ -818,6 +870,10 @@ func fieldsOf(d resource.Diff) []string {
 }
 
 // checkHealth runs post-apply verification on resources that support it.
+//
+// Health checks only read the host, so a dry run that asks for them (status)
+// gets them too. The verdict is reported alongside sync, never folded into
+// it: Result.OutOfSync looks at the action alone.
 func (rc *Context) checkHealth(g *graph, report *Report, changed map[resource.ID]bool) {
 	for i := range report.Results {
 		res := &report.Results[i]
@@ -830,9 +886,6 @@ func (rc *Context) checkHealth(g *graph, report *Report, changed map[resource.ID
 		}
 		checker, ok := n.res.(resource.Checker)
 		if !ok {
-			continue
-		}
-		if rc.opts.DryRun {
 			continue
 		}
 		status, detail, err := checker.Health(rc.resource)
@@ -854,7 +907,7 @@ func (rc *Context) checkHealth(g *graph, report *Report, changed map[resource.ID
 // question "does the host still hold what we wrote?" needs everything we
 // wrote, not the subset that happened to differ last time.
 func recordState(snap *state.Snapshot, n *node, res Result, revision string) {
-	raw, err := yaml.Marshal(n.doc)
+	raw, err := storedManifest(n)
 	if err != nil {
 		return
 	}
