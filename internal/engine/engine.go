@@ -272,13 +272,25 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 		return nil, errors.New("engine: no host provided")
 	}
 
-	docs, err := opts.Repo.SelectForE(opts.Node)
+	selected, err := opts.Repo.SelectForE(opts.Node)
 	if err != nil {
 		return nil, err
 	}
-	docs, err = filterDocs(docs, opts.Only)
+	docs, err := filterDocs(selected, opts.Only)
 	if err != nil {
 		return nil, err
+	}
+	// Resources this host declares that --only left out. A notification to
+	// one of them cannot be delivered, and the next full run will not deliver
+	// it either, because by then its notifier is in sync.
+	excluded := map[string]bool{}
+	if len(opts.Only) > 0 {
+		for _, doc := range selected {
+			excluded[doc.Ref()] = true
+		}
+		for _, doc := range docs {
+			delete(excluded, doc.Ref())
+		}
 	}
 
 	g, err := build(docs)
@@ -339,6 +351,13 @@ func Reconcile(ctx context.Context, opts Options) (*Report, error) {
 			for _, target := range n.notifies {
 				notified[target] = true
 			}
+			for _, ref := range n.doc.Notify {
+				if excluded[ref] {
+					report.Notes = append(report.Notes, fmt.Sprintf(
+						"%s is notified by %s but excluded by --only, so this run does not refresh it; "+
+							"include it in --only or refresh it by hand", ref, n.id))
+				}
+			}
 		}
 		if !opts.DryRun && res.Err == nil {
 			recordState(snap, n, res, opts.Revision)
@@ -394,9 +413,11 @@ func ownershipOf(snap *state.Snapshot, id resource.ID) Ownership {
 	}
 }
 
-func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot) Result {
+// out is a named result so the deferred bookkeeping below reaches the caller;
+// with an unnamed one it would update a copy after the return value was taken.
+func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot) (out Result) {
 	start := time.Now()
-	out := Result{
+	out = Result{
 		ID: n.id, Action: ActionNoop, Source: n.doc.Location(), Notified: wasNotified,
 		Owner: ownershipOf(snap, n.id),
 	}
@@ -445,19 +466,32 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 		}
 	}
 
+	rec, owned := snap.Resources[n.id.String()]
+	// A resource pointed at something else entirely (a new path, another
+	// account) has a record that describes the old thing. It can neither
+	// attribute drift on the new one nor serve as its adoption baseline.
+	moved := owned && claimsMoved(rec.Claims, out.Owner.Claims)
+	if dropped := claimsDropped(rec.Claims, out.Owner.Claims); owned && len(dropped) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"no longer manages %s: it is left in place as it is and is no longer owned by systemcd",
+			strings.Join(dropped, ", ")))
+	}
+
 	// Attribute the drift. If the host still holds every value systemcd last
 	// wrote, the repository is what moved; if it does not, something outside
 	// systemcd edited the machine. Only the second one is an incident.
-	if rec, owned := snap.Resources[n.id.String()]; owned && !diff.Empty() {
+	switch {
+	case diff.Empty():
+	case moved:
+		out.Owner.Origin = state.OriginRepo
+	case owned:
 		out.Owner.Origin = rec.OriginOf(observed, fieldsOf(diff))
 	}
 
-	if diff.Empty() && !wasNotified {
-		return out
-	}
-
 	if rc.opts.DryRun {
-		if diff.Empty() && wasNotified {
+		// Only a kind that can be refreshed will be; promising a refresh
+		// that apply then skips would make plan and apply disagree.
+		if _, refreshable := n.res.(resource.Refreshable); diff.Empty() && wasNotified && refreshable {
 			out.Action = ActionRefresh
 		}
 		return out
@@ -466,14 +500,20 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 	// If systemcd is about to take over something that already exists and has
 	// never been recorded, preserve the original contents first. After Apply
 	// the original is gone, and "release --restore" would have nothing to put
-	// back.
-	if _, owned := snap.Resources[n.id.String()]; !owned && out.Action != ActionCreate {
+	// back. This holds for a resource that is already in sync, too: it is
+	// recorded as adopted now, and a later repository change overwrites it.
+	// Without a state store no record will ever point at the copy.
+	if rc.opts.Store != nil && (!owned || moved) && out.Action != ActionCreate {
 		path, err := captureBaseline(rc.resource, n.res, n.id)
 		if err != nil {
 			out.Action, out.Err = ActionError, fmt.Errorf("capture baseline before adopting: %w", err)
 			return out
 		}
 		out.baselinePath = path
+	}
+
+	if diff.Empty() && !wasNotified {
+		return out
 	}
 
 	if !diff.Empty() {
@@ -484,8 +524,9 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 	}
 
 	// A resource that just started as part of its own apply does not also
-	// need the restart a notification would trigger.
-	if wasNotified && !startedByThisApply(diff) {
+	// need the restart a notification would trigger, and an Exec whose apply
+	// just ran its command must not run it a second time.
+	if wasNotified && !startedByThisApply(diff) && out.Action != ActionRun {
 		if r, ok := n.res.(resource.Refreshable); ok {
 			if err := r.Refresh(rc.resource); err != nil {
 				out.Action, out.Err = ActionError, fmt.Errorf("refresh: %w", err)
@@ -494,6 +535,30 @@ func (rc *Context) reconcileOne(n *node, wasNotified bool, snap *state.Snapshot)
 			if diff.Empty() {
 				out.Action = ActionRefresh
 			}
+		}
+	}
+	return out
+}
+
+// claimsMoved reports whether a resource now claims nothing it claimed when it
+// was recorded, i.e. the repository pointed it at a different thing.
+func claimsMoved(recorded, current []string) bool {
+	if len(recorded) == 0 || len(current) == 0 {
+		return false
+	}
+	return len(claimsDropped(recorded, current)) == len(recorded)
+}
+
+// claimsDropped lists recorded claims the resource no longer makes.
+func claimsDropped(recorded, current []string) []string {
+	have := make(map[string]bool, len(current))
+	for _, c := range current {
+		have[c] = true
+	}
+	var out []string
+	for _, c := range recorded {
+		if !have[c] {
+			out = append(out, c)
 		}
 	}
 	return out
@@ -546,6 +611,27 @@ func isAbsent(v string) bool {
 	return v == resource.Absent || v == "<absent>"
 }
 
+// assertsAbsence reports whether a resource's manifest only asks for things
+// not to exist (state: absent). When its desired state cannot be computed,
+// it is not treated as one, so pruning behaves as it always has.
+func assertsAbsence(c *resource.Context, r resource.Resource) bool {
+	desired, err := r.Desired(c)
+	if err != nil {
+		return false
+	}
+	asserted := false
+	for k, v := range desired {
+		if resource.Informational(k) {
+			continue
+		}
+		if !isAbsent(v) {
+			return false
+		}
+		asserted = true
+	}
+	return asserted
+}
+
 // blockDependents marks everything downstream of a failed resource as
 // unrunnable, so a missing package does not produce a cascade of confusing
 // secondary failures.
@@ -564,55 +650,65 @@ func blockDependents(g *graph, preds map[resource.ID]map[resource.ID]bool, faile
 // dependency order; with pruning off they are reported as orphans rather than
 // vanishing from the operator's view.
 func (rc *Context) reconcileOwnedButUndeclared(g *graph, snap *state.Snapshot) []Result {
-	var stale []*manifest.Document
+	var docs []*manifest.Document
+	var out []Result
+	unusable := func(ref, why string) {
+		// The stored manifest is unusable, so the resource can neither be
+		// rebuilt nor deleted. Say so instead of dropping it silently.
+		out = append(out, Result{
+			ID: idFromRef(ref), Action: ActionSkip, Source: "state",
+			Messages: []string{why},
+			Owner:    ownershipOf(snap, idFromRef(ref)),
+		})
+	}
 	for _, ref := range snap.Refs() {
 		rec := snap.Resources[ref]
 		id := resource.ID{Kind: rec.Kind, Name: rec.Name}
 		if _, live := g.nodes[id]; live {
 			continue
 		}
-		docs, err := manifest.Parse([]byte(rec.Manifest), "state:"+ref)
-		if err != nil || len(docs) == 0 {
-			// The stored manifest is unusable, so the resource can neither be
-			// rebuilt nor deleted. Say so instead of dropping it silently.
-			stale = append(stale, nil)
+		parsed, err := manifest.Parse([]byte(rec.Manifest), "state:"+ref)
+		if err != nil || len(parsed) == 0 {
+			unusable(ref, "state holds an unparsable manifest for this resource; it cannot be pruned automatically")
 			continue
 		}
-		stale = append(stale, docs[0])
-	}
-
-	var docs []*manifest.Document
-	var out []Result
-	for i, doc := range stale {
-		if doc == nil {
-			ref := snap.Refs()[i]
-			out = append(out, Result{
-				ID: idFromRef(ref), Action: ActionSkip, Source: "state",
-				Messages: []string{"state holds an unparsable manifest for this resource; it cannot be pruned automatically"},
-				Owner:    ownershipOf(snap, idFromRef(ref)),
-			})
+		// A manifest recorded by an older systemcd may no longer build (a
+		// kind removed, validation tightened). That is a stale record to
+		// deal with, not a failure of this run.
+		if _, err := resource.Build(parsed[0]); err != nil {
+			unusable(ref, fmt.Sprintf("the manifest recorded for this resource no longer builds (%v), so it cannot be pruned automatically; "+
+				"`systemcd release %s` drops the record without touching the host", err, ref))
 			continue
 		}
-		docs = append(docs, doc)
+		docs = append(docs, parsed[0])
 	}
 	if len(docs) == 0 {
 		return out
+	}
+
+	// What the repository still declares for this host. Deleting it because
+	// an old record also claims it would undo the resource that manages it.
+	live := map[string]resource.ID{}
+	for id, n := range g.nodes {
+		for _, c := range resource.ClaimsOf(n.res) {
+			live[c.String()] = id
+		}
 	}
 
 	ordered, err := build(docs)
 	if err != nil {
 		// Stale manifests can reference resources that no longer exist;
 		// fall back to reverse-alphabetical order.
-		return append(out, rc.handleStaleUnordered(docs, snap)...)
+		return append(out, rc.handleStaleUnordered(docs, snap, live)...)
 	}
 	for i := len(ordered.sorted) - 1; i >= 0; i-- {
 		n := ordered.sorted[i]
-		out = append(out, rc.handleStale(n.res, n.id, snap))
+		out = append(out, rc.handleStale(n.res, n.id, snap, live))
 	}
 	return out
 }
 
-func (rc *Context) handleStaleUnordered(stale []*manifest.Document, snap *state.Snapshot) []Result {
+func (rc *Context) handleStaleUnordered(stale []*manifest.Document, snap *state.Snapshot, live map[string]resource.ID) []Result {
 	sort.Slice(stale, func(i, j int) bool { return stale[i].Ref() > stale[j].Ref() })
 	var out []Result
 	for _, doc := range stale {
@@ -621,18 +717,51 @@ func (rc *Context) handleStaleUnordered(stale []*manifest.Document, snap *state.
 			out = append(out, Result{ID: resource.ID{Kind: doc.Kind, Name: doc.Metadata.Name}, Action: ActionError, Err: err})
 			continue
 		}
-		out = append(out, rc.handleStale(res, res.ID(), snap))
+		out = append(out, rc.handleStale(res, res.ID(), snap, live))
 	}
 	return out
 }
 
-func (rc *Context) handleStale(res resource.Resource, id resource.ID, snap *state.Snapshot) Result {
+func (rc *Context) handleStale(res resource.Resource, id resource.ID, snap *state.Snapshot, live map[string]resource.ID) (out Result) {
 	start := time.Now()
-	out := Result{ID: id, Action: ActionOrphan, Source: "state", Owner: ownershipOf(snap, id)}
+	out = Result{ID: id, Action: ActionOrphan, Source: "state", Owner: ownershipOf(snap, id)}
 	defer func() { out.Duration = time.Since(start) }()
+
+	// A resource renamed in git leaves its old name behind claiming the same
+	// path, package or account as the new one. Pruning the old name would
+	// delete what the new one manages.
+	var superseded []string
+	for _, c := range resource.ClaimsOf(res) {
+		if holder, ok := live[c.String()]; ok {
+			superseded = append(superseded, fmt.Sprintf("%s is now managed by %s", c, holder))
+		}
+	}
+	if len(superseded) > 0 {
+		why := fmt.Sprintf("%s, so this record is never pruned; `systemcd release %s` drops it without touching the host",
+			strings.Join(superseded, ", "), id)
+		if !rc.opts.Prune {
+			out.Messages = []string{"owned by systemcd but no longer declared in the repository; " + why}
+			return out
+		}
+		out.Action = ActionSkip
+		out.Messages = []string{why}
+		return out
+	}
 
 	if !rc.opts.Prune {
 		out.Messages = []string{"owned by systemcd but no longer declared in the repository; run with --prune to remove it"}
+		return out
+	}
+
+	// A resource that only asserted something must not exist ("telnet is not
+	// installed") created nothing. Retiring the assertion drops the record;
+	// deleting now would remove whatever someone has put there since.
+	if assertsAbsence(rc.resource, res) {
+		out.Action = ActionPrune
+		out.Messages = []string{"it only asserted that this does not exist, so nothing on the host is removed; the ownership record is dropped"}
+		if !rc.opts.DryRun {
+			delete(snap.Resources, id.String())
+		}
 		return out
 	}
 
@@ -740,6 +869,13 @@ func recordState(snap *state.Snapshot, n *node, res Result, revision string) {
 		Claims:   resource.ClaimStrings(resource.ClaimsOf(n.res)),
 		Applied:  map[string]string(res.desired),
 		Revision: revision,
+	}
+	// A resource the repository pointed at a different thing starts a new
+	// ownership: the old record's adoption snapshot and baseline describe
+	// something systemcd no longer manages, and restoring them here would
+	// write one file's original contents into another.
+	if existed && claimsMoved(prev.Claims, rec.Claims) {
+		existed = false
 	}
 
 	switch {

@@ -98,9 +98,9 @@ func Adopt(ctx context.Context, opts AdoptOptions) (*Report, error) {
 	return report, nil
 }
 
-func adoptOne(rc *resource.Context, n *node, snap *state.Snapshot, opts AdoptOptions) Result {
+func adoptOne(rc *resource.Context, n *node, snap *state.Snapshot, opts AdoptOptions) (out Result) {
 	start := time.Now()
-	out := Result{ID: n.id, Source: n.doc.Location(), Owner: ownershipOf(snap, n.id)}
+	out = Result{ID: n.id, Source: n.doc.Location(), Owner: ownershipOf(snap, n.id)}
 	out.Owner.Claims = resource.ClaimStrings(resource.ClaimsOf(n.res))
 	defer func() { out.Duration = time.Since(start) }()
 
@@ -262,10 +262,14 @@ func Release(ctx context.Context, opts ReleaseOptions) (*Report, error) {
 
 	// Anything the repository still declares for this node is "live", and
 	// releasing it without --force would be undone on the next reconcile.
+	// Targeting alone decides that: patches only narrow a declared resource,
+	// and a patch that fails to apply must not make the repository look empty.
 	live := map[string]bool{}
 	if opts.Repo != nil {
-		for _, doc := range opts.Repo.SelectFor(opts.Node) {
-			live[doc.Ref()] = true
+		for _, doc := range opts.Repo.Documents {
+			if doc.Kind != manifest.PatchKind && doc.Metadata.Targets.Matches(opts.Node) {
+				live[doc.Ref()] = true
+			}
 		}
 	}
 
@@ -296,10 +300,10 @@ func Release(ctx context.Context, opts ReleaseOptions) (*Report, error) {
 	return report, nil
 }
 
-func releaseOne(rc *resource.Context, ref string, snap *state.Snapshot, live map[string]bool, opts ReleaseOptions) Result {
+func releaseOne(rc *resource.Context, ref string, snap *state.Snapshot, live map[string]bool, opts ReleaseOptions) (out Result) {
 	start := time.Now()
 	id := idFromRef(ref)
-	out := Result{ID: id, Source: "state", Owner: ownershipOf(snap, id)}
+	out = Result{ID: id, Source: "state", Owner: ownershipOf(snap, id)}
 	defer func() { out.Duration = time.Since(start) }()
 
 	rec, owned := snap.Resources[ref]

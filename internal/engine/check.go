@@ -45,6 +45,18 @@ func Check(repo *manifest.Repository) error {
 		if !declared[spec.Target] {
 			problems = append(problems, fmt.Sprintf("%s: patch targets %q, which no document in this repository declares", p.Location(), spec.Target))
 		}
+		// Edges a patch adds are dropped at plan time when they point outside
+		// the working set, so a typo here would silently lose the ordering.
+		for _, ref := range spec.DependsOn {
+			if !declared[ref] {
+				problems = append(problems, fmt.Sprintf("%s: dependsOn references unknown resource %q", p.Location(), ref))
+			}
+		}
+		for _, ref := range spec.Notify {
+			if !declared[ref] {
+				problems = append(problems, fmt.Sprintf("%s: notify references unknown resource %q", p.Location(), ref))
+			}
+		}
 	}
 	if len(problems) > 0 {
 		sort.Strings(problems)
