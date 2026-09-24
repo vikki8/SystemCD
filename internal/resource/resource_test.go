@@ -401,7 +401,7 @@ spec:
 	}
 	// Both packages go out in a single invocation; the order is the diff's
 	// sorted order, which keeps runs reproducible.
-	if !h.Ran("apt-get install -y --no-install-recommends 'curl' 'nginx'") {
+	if !h.Ran("apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold 'curl' 'nginx'") {
 		t.Errorf("both packages should be installed in one call; commands = %v", h.Commands)
 	}
 }

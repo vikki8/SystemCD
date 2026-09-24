@@ -3,6 +3,7 @@ package resource
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/vikki8/systemcd/internal/manifest"
@@ -46,15 +47,36 @@ func buildPackage(doc *manifest.Document) (Resource, error) {
 
 func (p *Package) ID() ID { return ID{Kind: "Package", Name: p.name} }
 
+// packageNamePattern is the union of what apt, rpm, pacman and apk accept as
+// a package name, plus dpkg's ":arch" qualifier. Anything else either never
+// converges, because the query cannot find what the install was asked for
+// ("nginx=1.2", "@group", "nginx*"), or is read as an option by the package
+// tool ("-oAPT::..."), which quoting for the shell does not prevent.
+var packageNamePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._+:@-]*$`)
+
 func (p *Package) Validate() error {
+	candidates := append([]string(nil), p.spec.Names...)
 	if p.spec.Name != "" {
-		p.names = append(p.names, p.spec.Name)
+		candidates = append([]string{p.spec.Name}, candidates...)
 	}
-	p.names = append(p.names, p.spec.Names...)
-	if len(p.names) == 0 {
+	if len(candidates) == 0 {
 		// Default to the resource name so the common single-package case can
 		// omit the spec entirely.
-		p.names = []string{p.name}
+		candidates = []string{p.name}
+	}
+	p.names = nil
+	seen := map[string]bool{}
+	for _, n := range candidates {
+		if !packageNamePattern.MatchString(n) {
+			return fmt.Errorf("package name %q is not valid: it must start with a letter, digit or underscore "+
+				"and contain only letters, digits and . _ + : @ - (a version belongs in spec.version)", n)
+		}
+		// A repeated name would otherwise claim the same package twice and
+		// be reported as conflicting with itself.
+		if !seen[n] {
+			seen[n] = true
+			p.names = append(p.names, n)
+		}
 	}
 	state, err := normalizePresence(p.spec.State)
 	if err != nil {
@@ -91,7 +113,7 @@ func (p *Package) Observe(c *Context) (State, error) {
 	}
 	s := State{"_manager": mgr.name}
 	for _, n := range p.names {
-		installed, version, err := mgr.query(c, n)
+		installed, version, err := mgr.query(c, n, p.spec.Version)
 		if err != nil {
 			return nil, err
 		}
@@ -115,14 +137,16 @@ func (p *Package) Apply(c *Context, d Diff) error {
 	if err != nil {
 		return err
 	}
-	var install, remove []string
+	pinned := p.spec.Version != ""
+	var install, installNames, remove []string
 	for _, f := range d {
 		name := strings.TrimPrefix(f.Field, "pkg:")
 		if f.Want == Absent {
 			remove = append(remove, name)
 			continue
 		}
-		if p.spec.Version != "" {
+		installNames = append(installNames, name)
+		if pinned {
 			name = mgr.pin(name, p.spec.Version)
 		}
 		install = append(install, name)
@@ -134,8 +158,13 @@ func (p *Package) Apply(c *Context, d Diff) error {
 		}
 	}
 	if len(install) > 0 {
-		if err := mgr.install(c, install); err != nil {
+		if err := mgr.install(c, install, pinned); err != nil {
 			return err
+		}
+		if pinned && mgr.downgrade != nil {
+			if err := p.downgradeIfNeeded(c, mgr, installNames); err != nil {
+				return err
+			}
 		}
 		c.Log("installed %s", strings.Join(install, ", "))
 	}
@@ -148,14 +177,52 @@ func (p *Package) Apply(c *Context, d Diff) error {
 	return nil
 }
 
+// downgradeIfNeeded finishes a pinned install on managers whose install
+// command will not move a package to an older version.
+func (p *Package) downgradeIfNeeded(c *Context, mgr *packageManager, names []string) error {
+	for _, n := range names {
+		installed, version, err := mgr.query(c, n, p.spec.Version)
+		if err != nil {
+			return err
+		}
+		if !installed || version == p.spec.Version {
+			continue
+		}
+		if err := mgr.downgrade(c, []string{mgr.pin(n, p.spec.Version)}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Delete removes every package the resource declared, used when a Package
-// resource is pruned from the repository.
+// resource is pruned from the repository. Packages that are already gone are
+// skipped: pacman, zypper and apt (for a name no longer in the index) all fail
+// when asked to remove something that is not installed, which would leave
+// the prune failing on every run.
 func (p *Package) Delete(c *Context) error {
 	mgr, err := p.manager(c)
 	if err != nil {
 		return err
 	}
-	return mgr.remove(c, p.names)
+	var installed []string
+	for _, n := range p.names {
+		ok, _, err := mgr.query(c, n, "")
+		if err != nil {
+			return err
+		}
+		if ok {
+			installed = append(installed, n)
+		}
+	}
+	if len(installed) == 0 {
+		return nil
+	}
+	if err := mgr.remove(c, installed); err != nil {
+		return err
+	}
+	c.Log("removed %s", strings.Join(installed, ", "))
+	return nil
 }
 
 // manager resolves the package manager and refuses up front if the manifest
@@ -184,12 +251,22 @@ func (p *Package) manager(c *Context) (*packageManager, error) {
 type packageManager struct {
 	name string
 	// binary is what detection looks for on PATH.
-	binary  string
-	query   func(c *Context, pkg string) (installed bool, version string, err error)
-	install func(c *Context, pkgs []string) error
+	binary string
+	// query reports whether pkg is installed and its version. want is the
+	// pinned version, if any: the installed version is rendered in the same
+	// form (with or without epoch, release, arch) so a pin round-trips, and
+	// when several instances are installed side by side (multilib, multiarch,
+	// install-only kernels) the one matching want is preferred.
+	query func(c *Context, pkg, want string) (installed bool, version string, err error)
+	// install is told whether the packages carry a version pin, so it can
+	// permit the downgrade an exact pin may need.
+	install func(c *Context, pkgs []string, pinned bool) error
 	remove  func(c *Context, pkgs []string) error
 	update  func(c *Context) error
 	pin     func(pkg, version string) string
+	// downgrade, when set, runs after a pinned install that left the package
+	// at another version, for managers whose install never goes backwards.
+	downgrade func(c *Context, pkgs []string) error
 	// pinnable records whether systemcd can actually *guarantee* convergence
 	// to an exact version with this manager: install a specific version,
 	// downgrade to it if a newer one is present, and read back a version
@@ -252,34 +329,107 @@ func detectManager(c *Context) (*packageManager, error) {
 }
 
 // dpkgQuery reports installation status on Debian-family systems.
-func dpkgQuery(c *Context, pkg string) (bool, string, error) {
-	res, err := c.Host.Run(c.Ctx, "dpkg-query", "-W", "-f=${db:Status-Status} ${Version}", pkg)
+//
+// The format ends in a newline because a name without an architecture
+// qualifier matches every installed architecture of a Multi-Arch package, and
+// without one the lines run together ("installed 2.39-0ubuntu8installed
+// 2.39-0ubuntu8").
+func dpkgQuery(c *Context, pkg, want string) (bool, string, error) {
+	res, err := c.Host.Run(c.Ctx, "dpkg-query", "-W", "-f=${db:Status-Status} ${Version}\n", pkg)
 	if err != nil {
 		return false, "", err
 	}
 	if !res.OK() {
 		return false, "", nil
 	}
-	fields := strings.Fields(res.Stdout)
-	if len(fields) == 0 || fields[0] != "installed" {
-		return false, "", nil
+	installed := false
+	var versions []string
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "installed", "triggers-awaited", "triggers-pending":
+			// The trigger states are a configured package whose triggers
+			// have not run yet; reinstalling would not change them.
+		default:
+			// not-installed, config-files, half-installed, unpacked and
+			// half-configured are not usable, so an install is the fix.
+			continue
+		}
+		installed = true
+		if len(fields) > 1 {
+			versions = append(versions, fields[1])
+		}
 	}
-	version := ""
-	if len(fields) > 1 {
-		version = fields[1]
-	}
-	return true, version, nil
+	return installed, pickVersion(versions, want), nil
 }
 
-func rpmQuery(c *Context, pkg string) (bool, string, error) {
-	res, err := c.Host.Run(c.Ctx, "rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", pkg)
+func rpmQuery(c *Context, pkg, want string) (bool, string, error) {
+	res, err := c.Host.Run(c.Ctx, "rpm", "-q", "--queryformat", "%{EPOCH} %{VERSION} %{RELEASE} %{ARCH}\n", pkg)
 	if err != nil {
 		return false, "", err
 	}
 	if !res.OK() {
 		return false, "", nil
 	}
-	return true, strings.TrimSpace(res.Stdout), nil
+	var versions []string
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		fields := strings.Fields(line)
+		switch len(fields) {
+		case 0:
+			continue
+		case 4:
+			versions = append(versions, rpmVersion(fields[0], fields[1], fields[2], fields[3], want))
+		default:
+			versions = append(versions, strings.TrimSpace(line))
+		}
+	}
+	return true, pickVersion(versions, want), nil
+}
+
+// rpmVersion renders an installed package's EVR in the form the manifest
+// wrote its pin, so "1.20.1", "1.20.1-14.el9", "1:1.20.1-14.el9" and
+// "1.20.1-14.el9.x86_64" each read back exactly as written once installed.
+// Without a pin it is the conventional version-release.
+func rpmVersion(epoch, version, release, arch, want string) string {
+	if want == "" {
+		return version + "-" + release
+	}
+	body := want
+	_, afterEpoch, hasEpoch := strings.Cut(want, ":")
+	if hasEpoch {
+		body = afterEpoch
+	}
+	out := version
+	if strings.Contains(body, "-") {
+		out += "-" + release
+		if strings.HasSuffix(body, "."+arch) {
+			out += "." + arch
+		}
+	}
+	if hasEpoch {
+		if epoch == "(none)" {
+			epoch = "0"
+		}
+		out = epoch + ":" + out
+	}
+	return out
+}
+
+// pickVersion chooses which installed instance to report: the pinned version
+// if it is among them, otherwise the first.
+func pickVersion(versions []string, want string) string {
+	for _, v := range versions {
+		if want != "" && v == want {
+			return v
+		}
+	}
+	if len(versions) == 0 {
+		return ""
+	}
+	return versions[0]
 }
 
 func runManager(c *Context, script string) error {
@@ -288,9 +438,21 @@ func runManager(c *Context, script string) error {
 		return err
 	}
 	if !res.OK() {
-		return fmt.Errorf("%s: exit %d: %s", strings.Fields(script)[0], res.ExitCode, firstLine(res.Stderr, res.Stdout))
+		return fmt.Errorf("%s: exit %d: %s", commandName(script), res.ExitCode, firstLine(res.Stderr, res.Stdout))
 	}
 	return nil
+}
+
+// commandName is the program a script runs, skipping leading environment
+// assignments so an apt failure is reported as apt-get, not DEBIAN_FRONTEND.
+func commandName(script string) string {
+	fields := strings.Fields(script)
+	for _, f := range fields {
+		if !strings.Contains(f, "=") {
+			return f
+		}
+	}
+	return script
 }
 
 func quoteAll(pkgs []string) string {
@@ -305,8 +467,19 @@ func init() {
 	managers = map[string]*packageManager{
 		"apt": {
 			name: "apt", binary: "apt-get", query: dpkgQuery,
-			install: func(c *Context, p []string) error {
-				return runManager(c, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "+quoteAll(p))
+			install: func(c *Context, p []string, pinned bool) error {
+				// systemcd manages config files itself, so keep the copy on
+				// disk: without these, a modified conffile makes dpkg prompt,
+				// and with no terminal the install dies with "end of file on
+				// stdin at conffile prompt".
+				cmd := "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
+					"-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+				if pinned {
+					// -y alone refuses downgrades, and a pin may be older
+					// than what is installed.
+					cmd += " --allow-downgrades"
+				}
+				return runManager(c, cmd+" "+quoteAll(p))
 			},
 			remove: func(c *Context, p []string) error {
 				return runManager(c, "DEBIAN_FRONTEND=noninteractive apt-get remove -y "+quoteAll(p))
@@ -317,7 +490,7 @@ func init() {
 		},
 		"dnf": {
 			name: "dnf", binary: "dnf", query: rpmQuery,
-			install:  func(c *Context, p []string) error { return runManager(c, "dnf install -y "+quoteAll(p)) },
+			install:  func(c *Context, p []string, _ bool) error { return runManager(c, "dnf install -y "+quoteAll(p)) },
 			remove:   func(c *Context, p []string) error { return runManager(c, "dnf remove -y "+quoteAll(p)) },
 			update:   func(c *Context) error { return runManager(c, "dnf makecache") },
 			pin:      func(pkg, v string) string { return pkg + "-" + v },
@@ -325,16 +498,25 @@ func init() {
 		},
 		"yum": {
 			name: "yum", binary: "yum", query: rpmQuery,
-			install:  func(c *Context, p []string) error { return runManager(c, "yum install -y "+quoteAll(p)) },
+			install:  func(c *Context, p []string, _ bool) error { return runManager(c, "yum install -y "+quoteAll(p)) },
 			remove:   func(c *Context, p []string) error { return runManager(c, "yum remove -y "+quoteAll(p)) },
 			update:   func(c *Context) error { return runManager(c, "yum makecache") },
 			pin:      func(pkg, v string) string { return pkg + "-" + v },
 			pinnable: true,
+			// yum 3 answers an install of an older version with "Nothing to
+			// do" and exit 0; only `yum downgrade` goes backwards.
+			downgrade: func(c *Context, p []string) error { return runManager(c, "yum downgrade -y "+quoteAll(p)) },
 		},
 		"zypper": {
 			name: "zypper", binary: "zypper", query: rpmQuery,
-			install: func(c *Context, p []string) error {
-				return runManager(c, "zypper --non-interactive install "+quoteAll(p))
+			install: func(c *Context, p []string, pinned bool) error {
+				cmd := "zypper --non-interactive install"
+				if pinned {
+					// Without it zypper will not replace a newer version
+					// with the older one a pin names.
+					cmd += " --oldpackage"
+				}
+				return runManager(c, cmd+" "+quoteAll(p))
 			},
 			remove: func(c *Context, p []string) error {
 				return runManager(c, "zypper --non-interactive remove "+quoteAll(p))
@@ -345,7 +527,7 @@ func init() {
 		},
 		"pacman": {
 			name: "pacman", binary: "pacman",
-			query: func(c *Context, pkg string) (bool, string, error) {
+			query: func(c *Context, pkg, _ string) (bool, string, error) {
 				res, err := c.Host.Run(c.Ctx, "pacman", "-Q", pkg)
 				if err != nil {
 					return false, "", err
@@ -359,7 +541,7 @@ func init() {
 				}
 				return true, fields[1], nil
 			},
-			install: func(c *Context, p []string) error {
+			install: func(c *Context, p []string, _ bool) error {
 				return runManager(c, "pacman -S --noconfirm --needed "+quoteAll(p))
 			},
 			remove: func(c *Context, p []string) error { return runManager(c, "pacman -R --noconfirm "+quoteAll(p)) },
@@ -370,7 +552,7 @@ func init() {
 		},
 		"apk": {
 			name: "apk", binary: "apk",
-			query: func(c *Context, pkg string) (bool, string, error) {
+			query: func(c *Context, pkg, _ string) (bool, string, error) {
 				// -v prints "nginx-1.24.0-r7", which is the only way to learn
 				// the installed version without parsing `apk list`.
 				res, err := c.Host.Run(c.Ctx, "apk", "info", "-e", "-v", pkg)
@@ -383,7 +565,7 @@ func init() {
 				}
 				return true, strings.TrimPrefix(firstLine(out), pkg+"-"), nil
 			},
-			install: func(c *Context, p []string) error { return runManager(c, "apk add --no-cache "+quoteAll(p)) },
+			install: func(c *Context, p []string, _ bool) error { return runManager(c, "apk add --no-cache "+quoteAll(p)) },
 			remove:  func(c *Context, p []string) error { return runManager(c, "apk del "+quoteAll(p)) },
 			update:  func(c *Context) error { return runManager(c, "apk update") },
 			pin:     func(pkg, v string) string { return pkg + "=" + v },
