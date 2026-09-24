@@ -15,6 +15,7 @@ import (
 
 	"github.com/vikki8/systemcd/internal/engine"
 	"github.com/vikki8/systemcd/internal/host"
+	"github.com/vikki8/systemcd/internal/report"
 )
 
 // Render turns a report into Prometheus exposition format.
@@ -41,8 +42,22 @@ func Render(rep *engine.Report, paused bool) []byte {
 		"Resources evaluated in the last reconcile.", "gauge", c.Total)
 	metric("systemcd_resources_in_sync",
 		"Resources already matching the repository.", "gauge", c.InSync)
+	// A dry run (a paused or report-only pass) changed nothing; what it
+	// would have changed is systemcd_resources_out_of_sync.
+	changed := c.Changed
+	if rep.DryRun {
+		changed = 0
+	}
+	outOfSync := 0
+	for _, res := range rep.Results {
+		if report.StillOutOfSync(rep, res) {
+			outOfSync++
+		}
+	}
 	metric("systemcd_resources_changed",
-		"Resources changed by the last reconcile.", "gauge", c.Changed)
+		"Resources changed by the last reconcile.", "gauge", changed)
+	metric("systemcd_resources_out_of_sync",
+		"Resources that still differ from the repository after the last reconcile.", "gauge", outOfSync)
 	metric("systemcd_resources_failed",
 		"Resources that failed to converge.", "gauge", c.Failed)
 	metric("systemcd_resources_degraded",
@@ -58,13 +73,16 @@ func Render(rep *engine.Report, paused bool) []byte {
 
 	metric("systemcd_paused",
 		"1 when reconciliation is paused on this host.", "gauge", boolToInt(paused))
+	// After an apply that converged everything the host no longer differs,
+	// even though the pass found drift; an alert on this must not fire after
+	// every successful self-heal.
 	metric("systemcd_out_of_sync",
-		"1 when the host differs from the repository.", "gauge", boolToInt(rep.OutOfSync()))
+		"1 when the host differs from the repository.", "gauge", boolToInt(outOfSync > 0))
 
 	if rep.Revision != "" {
 		metric("systemcd_revision_info",
 			"The git revision last applied, as a label.", "gauge", 1,
-			fmt.Sprintf("revision=%q", rep.Revision))
+			"revision="+labelValue(rep.Revision))
 	}
 
 	// Per-resource series, so an alert can name the resource rather than only
@@ -73,10 +91,35 @@ func Render(rep *engine.Report, paused bool) []byte {
 	results := append([]engine.Result(nil), rep.Results...)
 	sort.SliceStable(results, func(i, j int) bool { return results[i].ID.String() < results[j].ID.String() })
 	for _, res := range results {
-		fmt.Fprintf(&b, "systemcd_resource_out_of_sync{kind=%q,name=%q,origin=%q} %d\n",
-			res.ID.Kind, res.ID.Name, string(res.Owner.Origin), boolToInt(res.OutOfSync()))
+		fmt.Fprintf(&b, "systemcd_resource_out_of_sync{kind=%s,name=%s,origin=%s} %d\n",
+			labelValue(res.ID.Kind), labelValue(res.ID.Name), labelValue(string(res.Owner.Origin)),
+			boolToInt(report.StillOutOfSync(rep, res)))
 	}
 	return []byte(b.String())
+}
+
+// labelValue quotes a label value the way the Prometheus text format
+// requires. Go's %q is not that: it emits \t, \x00 and \u escapes the format
+// does not have, and one bad line makes node_exporter drop the whole file.
+// Only backslash, double quote and newline are escaped.
+func labelValue(s string) string {
+	s = strings.ToValidUTF8(s, "�")
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // Write publishes the metrics to a textfile-collector directory.
