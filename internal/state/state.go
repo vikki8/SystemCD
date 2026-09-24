@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"time"
 
@@ -104,9 +105,17 @@ type Snapshot struct {
 	Revision  string            `json:"revision,omitempty"`
 	UpdatedAt time.Time         `json:"updatedAt"`
 	Resources map[string]Record `json:"resources"`
+	// Changed is how many resources the last apply at Revision changed, kept
+	// so the history entry written when Revision moves on can say so.
+	Changed int `json:"changed,omitempty"`
 	// History holds the revisions applied before the current one, newest
 	// first, so `rollback` has somewhere to go.
 	History []HistoryEntry `json:"history,omitempty"`
+	// PendingRefresh lists resources owed a notify-driven refresh that an
+	// earlier run could not deliver: the target failed, was skipped, or was
+	// left out by --only. Without this the refresh is lost for good, since
+	// by the next run the notifier that changed is already in sync.
+	PendingRefresh []string `json:"pendingRefresh,omitempty"`
 }
 
 // HistoryEntry records one successful apply.
@@ -255,7 +264,7 @@ func (s *Store) Save(snap *Snapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := s.Host.MkdirAll(paths.DataDir, 0o700); err != nil {
+	if err := s.Host.MkdirAll(path.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
 
@@ -290,22 +299,31 @@ func (s *Store) Save(snap *Snapshot) error {
 // the same machine at once would interleave writes and race each other's
 // state, so the second one waits its turn or gives up.
 func (s *Store) Lock() (func() error, error) {
-	return s.Host.TryLock(paths.LockFile)
+	return s.Host.TryLock(s.LockPath())
 }
+
+// LockPath is the file Lock takes: next to the state file it protects, which
+// for the default store is paths.LockFile.
+func (s *Store) LockPath() string { return path.Join(path.Dir(s.Path), path.Base(paths.LockFile)) }
 
 // RecordApply updates the snapshot after a successful reconcile.
 func (snap *Snapshot) RecordApply(revision string, changed int) {
-	if revision != "" && revision != snap.Revision {
+	if revision == "" {
+		return
+	}
+	// Before the first apply there is no previous revision to remember.
+	if revision != snap.Revision && snap.Revision != "" {
 		snap.History = append([]HistoryEntry{{
 			Revision:  snap.Revision,
 			AppliedAt: snap.UpdatedAt,
-			Changed:   changed,
+			Changed:   snap.Changed,
 		}}, snap.History...)
 		if len(snap.History) > maxHistory {
 			snap.History = snap.History[:maxHistory]
 		}
-		snap.Revision = revision
 	}
+	snap.Revision = revision
+	snap.Changed = changed
 }
 
 // PreviousRevision returns the most recent revision before the current one.
