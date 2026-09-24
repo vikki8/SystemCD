@@ -15,6 +15,7 @@ import (
 	"github.com/vikki8/systemcd/internal/host"
 	"github.com/vikki8/systemcd/internal/manifest"
 	"github.com/vikki8/systemcd/internal/paths"
+	"gopkg.in/yaml.v3"
 )
 
 func init() {
@@ -46,6 +47,12 @@ type File struct {
 	name string
 	spec FileSpec
 	mode fs.FileMode
+	// contentUnmanaged is set when the manifest names neither content nor
+	// source. The file is then held to its mode and ownership only, and
+	// created empty if missing, rather than truncated on every apply: an
+	// omitted field means "not managed", the same thing `content: null` in a
+	// Patch means.
+	contentUnmanaged bool
 }
 
 var _ Resource = (*File)(nil)
@@ -56,7 +63,26 @@ func buildFile(doc *manifest.Document) (Resource, error) {
 	if err := doc.DecodeSpec(&f.spec); err != nil {
 		return nil, err
 	}
+	f.contentUnmanaged = !specHasKey(&doc.Spec, "content") && !specHasKey(&doc.Spec, "source")
 	return f, nil
+}
+
+// specHasKey reports whether a document's spec mapping sets key at all, which
+// is what tells an omitted field apart from one set to its zero value.
+func specHasKey(spec *yaml.Node, key string) bool {
+	n := spec
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		n = n.Content[0]
+	}
+	if n.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return n.Content[i+1].Tag != "!!null"
+		}
+	}
+	return false
 }
 
 func (f *File) ID() ID { return ID{Kind: "File", Name: f.name} }
@@ -143,11 +169,6 @@ func (f *File) Desired(c *Context) (State, error) {
 	if f.spec.State == Absent {
 		return s, nil
 	}
-	data, err := f.content(c)
-	if err != nil {
-		return nil, err
-	}
-	s["checksum"] = checksum(data)
 	s["mode"] = modeString(f.mode)
 	if f.spec.Owner != "" {
 		s["owner"] = f.spec.Owner
@@ -155,6 +176,14 @@ func (f *File) Desired(c *Context) (State, error) {
 	if f.spec.Group != "" {
 		s["group"] = f.spec.Group
 	}
+	if f.contentUnmanaged {
+		return s, nil
+	}
+	data, err := f.content(c)
+	if err != nil {
+		return nil, err
+	}
+	s["checksum"] = checksum(data)
 	s["_bytes"] = strconv.Itoa(len(data))
 	return s, nil
 }
