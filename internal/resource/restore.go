@@ -115,13 +115,23 @@ func (f *File) Restore(c *Context, prior State, blob []byte) error {
 		}
 		mode = parsed
 	}
+	// Writing publishes a new file, owned by systemcd. Whichever of owner and
+	// group the manifest never managed is carried over from the file being
+	// replaced, since systemcd did not change it and restoring the recorded
+	// value would undo an operator's own later chown.
+	// With no file to carry them over from, the recorded values are the best
+	// description of what was there.
+	keepUID, keepGID, replacing := -1, -1, false
+	if info, err := c.Host.Stat(f.spec.Path); err == nil && !info.IsDir && info.Target == "" {
+		keepUID, keepGID, replacing = info.UID, info.GID, true
+	}
 	// WriteFile sets the mode on the new file before publishing it; a chmod
 	// by path afterwards would follow a symlink swapped in after the rename.
 	if err := c.Host.WriteFile(f.spec.Path, blob, mode); err != nil {
 		return err
 	}
 	c.Log("restored %s to its pre-adoption contents (%d bytes)", f.spec.Path, len(blob))
-	return restoreOwnership(c, f.spec.Path, prior)
+	return restoreOwnership(c, f.spec.Path, prior, f.spec.Owner != "" || !replacing, f.spec.Group != "" || !replacing, keepUID, keepGID)
 }
 
 // Directory -------------------------------------------------------------
@@ -147,7 +157,7 @@ func (d *Directory) Restore(c *Context, prior State, _ []byte) error {
 			return err
 		}
 	}
-	return restoreOwnership(c, d.spec.Path, prior)
+	return restoreOwnership(c, d.spec.Path, prior, d.spec.Owner != "", d.spec.Group != "", -1, -1)
 }
 
 // SystemdUnit -----------------------------------------------------------
@@ -231,28 +241,29 @@ func (s *Sysctl) Restore(c *Context, prior State, _ []byte) error {
 	return nil
 }
 
-// restoreOwnership puts back the recorded owner and group, when they were
-// captured and can still be resolved.
-func restoreOwnership(c *Context, path string, prior State) error {
-	owner, hasOwner := prior["owner"]
-	group, hasGroup := prior["group"]
-	if !hasOwner && !hasGroup {
-		return nil
-	}
-	uid, gid := -1, -1
-	if hasOwner {
+// restoreOwnership puts back the recorded owner and group where restoreOwner
+// and restoreGroup say to: normally only the ones the manifest managed, since
+// systemcd never changed the other and restoring it would undo an operator's
+// own later chown. keepUID and keepGID (-1 for none) are the ids to leave in
+// place of a field that is not restored.
+func restoreOwnership(c *Context, path string, prior State, restoreOwner, restoreGroup bool, keepUID, keepGID int) error {
+	uid, gid := keepUID, keepGID
+	if owner, ok := prior["owner"]; ok && restoreOwner {
 		id, err := lookupIDOrNumeric(owner, c.Host.LookupUID)
 		if err != nil {
 			return fmt.Errorf("restoring owner %q: %w", owner, err)
 		}
 		uid = id
 	}
-	if hasGroup {
+	if group, ok := prior["group"]; ok && restoreGroup {
 		id, err := lookupIDOrNumeric(group, c.Host.LookupGID)
 		if err != nil {
 			return fmt.Errorf("restoring group %q: %w", group, err)
 		}
 		gid = id
+	}
+	if uid == -1 && gid == -1 {
+		return nil
 	}
 	return c.Host.Chown(path, uid, gid)
 }
