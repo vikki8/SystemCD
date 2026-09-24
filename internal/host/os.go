@@ -234,10 +234,11 @@ func (h *OSHost) Stat(path string) (FileInfo, error) {
 		return FileInfo{}, err
 	}
 	info := FileInfo{
-		Path:  path,
-		Mode:  fi.Mode().Perm(),
-		Size:  fi.Size(),
-		IsDir: fi.IsDir(),
+		Path:    path,
+		Mode:    fi.Mode().Perm(),
+		Size:    fi.Size(),
+		IsDir:   fi.IsDir(),
+		Regular: fi.Mode().IsRegular(),
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		info.UID = int(st.Uid)

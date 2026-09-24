@@ -280,13 +280,14 @@ func (m *MemHost) Stat(p string) (FileInfo, error) {
 		size = int64(len(f.target))
 	}
 	return FileInfo{
-		Path:   cp,
-		Mode:   f.mode.Perm(),
-		UID:    f.uid,
-		GID:    f.gid,
-		Size:   size,
-		IsDir:  f.isDir,
-		Target: f.target,
+		Path:    cp,
+		Mode:    f.mode.Perm(),
+		UID:     f.uid,
+		GID:     f.gid,
+		Size:    size,
+		IsDir:   f.isDir,
+		Regular: !f.isDir && !f.isSymlink(),
+		Target:  f.target,
 	}, nil
 }
 
@@ -362,8 +363,16 @@ func (m *MemHost) RemoveAll(p string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := clean(p)
+	prefix := cp + "/"
+	if cp == "/" {
+		prefix = "/"
+	}
 	for q := range m.files {
-		if q == cp || strings.HasPrefix(q, cp+"/") {
+		if q == "/" {
+			// The root itself cannot be removed, only emptied.
+			continue
+		}
+		if q == cp || strings.HasPrefix(q, prefix) {
 			delete(m.files, q)
 		}
 	}

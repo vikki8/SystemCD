@@ -225,3 +225,42 @@ func TestReadingADirectoryIsAnErrorNotAbsence(t *testing.T) {
 		}
 	})
 }
+
+func TestStatReportsWhetherAPathIsARegularFile(t *testing.T) {
+	// A FIFO at a managed path would block ReadFile forever; callers need
+	// to be able to tell a regular file from everything else.
+	eachHost(t, func(t *testing.T, h Host) {
+		must(t, h.WriteFile("/f", []byte("x"), 0o644))
+		must(t, h.MkdirAll("/d", 0o755))
+		must(t, h.Symlink("f", "/l"))
+		for p, want := range map[string]bool{"/f": true, "/d": false, "/l": false} {
+			info, err := h.Stat(p)
+			must(t, err)
+			if info.Regular != want {
+				t.Errorf("Stat(%s).Regular = %v, want %v", p, info.Regular, want)
+			}
+		}
+	})
+}
+
+func TestOSHostStatMarksAFIFOIrregular(t *testing.T) {
+	root := t.TempDir()
+	if err := syscall.Mkfifo(root+"/fifo", 0o644); err != nil {
+		t.Skip("mkfifo:", err)
+	}
+	info, err := NewRootedOS(root).Stat("/fifo")
+	must(t, err)
+	if info.Regular || info.IsDir {
+		t.Errorf("a FIFO reported as %+v", info)
+	}
+}
+
+func TestMemRemoveAllOfRootEmptiesIt(t *testing.T) {
+	m := NewMem()
+	must(t, m.WriteFile("/etc/a", []byte("x"), 0o644))
+	must(t, m.RemoveAll("/"))
+	if got := m.Paths(); len(got) != 1 || got[0] != "/" {
+		t.Errorf("paths after RemoveAll(/) = %v, want only the root", got)
+	}
+	must(t, m.WriteFile("/etc/b", []byte("y"), 0o644))
+}

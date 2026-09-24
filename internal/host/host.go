@@ -47,6 +47,10 @@ type FileInfo struct {
 	GID   int
 	Size  int64
 	IsDir bool
+	// Regular is true for a regular file, and false for directories,
+	// symlinks, FIFOs, sockets and devices. Reading a FIFO blocks until a
+	// writer appears, so check this before ReadFile on an untrusted path.
+	Regular bool
 	// Target is the link destination when the path is a symlink.
 	Target string
 }
