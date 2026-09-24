@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -355,7 +357,7 @@ func TestMovingAResourceToANewPathIsARepositoryChange(t *testing.T) {
 func TestCheckRejectsAPatchEdgeToAnUndeclaredResource(t *testing.T) {
 	// A typo in an edge a patch adds would otherwise be dropped silently at
 	// plan time as "outside the working set", losing the ordering for good.
-	repo := repoFrom(t, fileDoc("app-conf", "/etc/app.conf", "x")+`
+	repo := loadUnvalidated(t, fileDoc("app-conf", "/etc/app.conf", "x")+`
 ---
 apiVersion: systemcd.dev/v1
 kind: Patch
@@ -366,6 +368,9 @@ spec:
   dependsOn: [Package/ngnix]
   notify: [Service/ngnix]
 `)
+	if repo.Validate() == nil {
+		t.Error("the manifest layer must reject edges to resources the repository does not declare")
+	}
 	err := Check(repo)
 	if err == nil {
 		t.Fatal("validate must reject edges to resources the repository does not declare")
@@ -383,26 +388,17 @@ func TestReleaseStillRefusesWhenAPatchIsBroken(t *testing.T) {
 	h, store := adoptHost(t)
 	adopt(t, h, store, repoFrom(t, adoptRepo), false)
 
-	broken := repoFrom(t, adoptRepo+`
----
-apiVersion: systemcd.dev/v1
-kind: File
-metadata:
-  name: web-only
-  targets:
-    hosts: ["web-*"]
-spec:
-  path: /etc/web.conf
-  content: "w\n"
+	// A patch that is not a mapping cannot be merged, so selecting this
+	// host's documents fails.
+	broken := loadUnvalidated(t, adoptRepo+`
 ---
 apiVersion: systemcd.dev/v1
 kind: Patch
 metadata:
-  name: tighten-web
+  name: tighten
 spec:
-  target: File/web-only
-  patch:
-    mode: "0600"
+  target: File/app-conf
+  patch: [mode, "0600"]
 `)
 	if _, err := broken.SelectForE(manifest.Node{Hostname: "legacy-01"}); err == nil {
 		t.Fatal("setup: the patch should fail to apply on legacy-01")
@@ -415,4 +411,19 @@ spec:
 	if snap, _ := store.Load(); len(snap.Resources) != 1 {
 		t.Error("ownership must be left intact")
 	}
+}
+
+// loadUnvalidated loads a repository without the manifest layer's Validate,
+// for tests that need a repository it would reject.
+func loadUnvalidated(t *testing.T, src string) *manifest.Repository {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "manifests.yaml"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manifest.Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	return repo
 }
