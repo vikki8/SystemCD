@@ -1,16 +1,18 @@
 package inventory
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"path"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/vikki8/systemcd/internal/host"
 	"github.com/vikki8/systemcd/internal/resource"
+	"gopkg.in/yaml.v3"
 )
 
 // GenerateOptions configures turning a scan into manifests.
@@ -60,14 +62,41 @@ func Generate(rep *Report, opts GenerateOptions) (*GenerateResult, error) {
 		opts.MaxFileBytes = DefaultMaxFileBytes
 	}
 
+	// An earlier snapshot may already have been reviewed and edited; it is
+	// not this run's to replace.
+	manifestPath := path.Join(opts.Dir, "manifests", "discovered.yaml")
+	if _, err := opts.Host.Stat(manifestPath); err == nil {
+		return nil, fmt.Errorf("inventory: %s already exists; move it aside or generate into another directory", manifestPath)
+	} else if !errors.Is(err, host.ErrNotExist) {
+		return nil, err
+	}
+
 	out := &GenerateResult{}
+	// A snapshot of an incomplete scan is incomplete too, and this is the
+	// only place a generate run reports.
+	for _, note := range rep.Skipped {
+		out.Skipped = append(out.Skipped, "scan incomplete: "+note)
+	}
 	var docs []string
 	usedNames := map[string]bool{}
+	// Payloads already under files/ are named around, never overwritten.
+	if existing, err := opts.Host.ReadDir(path.Join(opts.Dir, "files")); err == nil {
+		for _, name := range existing {
+			usedNames[name] = true
+		}
+	}
+	generated := map[string]bool{}
 
 	for _, item := range rep.Unmanaged() {
 		if len(opts.Categories) > 0 && !containsCategory(opts.Categories, item.Category) {
 			continue
 		}
+		// One path is often found by several scans (a local unit is also
+		// unpackaged config); two resources claiming it would not load.
+		if generated[item.Claim] {
+			continue
+		}
+		generated[item.Claim] = true
 		doc, extra, err := generateOne(item, opts, usedNames)
 		if err != nil {
 			out.Skipped = append(out.Skipped, fmt.Sprintf("%s: %v", item.Claim, err))
@@ -91,7 +120,6 @@ func Generate(rep *Report, opts GenerateOptions) (*GenerateResult, error) {
 		"# managed, then `systemcd adopt` to take ownership without changing\n" +
 		"# anything, and edit from there.\n"
 
-	manifestPath := path.Join(opts.Dir, "manifests", "discovered.yaml")
 	body := header + strings.Join(docs, "---\n")
 	if err := opts.Host.WriteFile(manifestPath, []byte(body), 0o644); err != nil {
 		return nil, err
@@ -118,26 +146,54 @@ func generateOne(item Item, opts GenerateOptions, used map[string]bool) (string,
 		return generateFile(item, claim.Key, opts, used)
 	case resource.ClaimUnit:
 		name := uniqueName(strings.TrimSuffix(claim.Key, ".service"), used)
-		return renderDoc("Service", name, opts.Targets, map[string]string{
+		doc, err := renderDoc("Service", name, opts.Targets, map[string]any{
 			"unit":    claim.Key,
-			"enabled": "true",
-			"state":   "started",
-		}), nil, nil
+			"enabled": true,
+			"state":   serviceState(opts, claim.Key),
+		})
+		return doc, nil, err
 	case resource.ClaimPackage:
 		name := uniqueName(claim.Key, used)
-		return renderDoc("Package", name, opts.Targets, map[string]string{"name": claim.Key}), nil, nil
+		doc, err := renderDoc("Package", name, opts.Targets, map[string]any{"name": claim.Key})
+		return doc, nil, err
 	case resource.ClaimUser:
 		name := uniqueName(claim.Key, used)
-		return renderDoc("User", name, opts.Targets, map[string]string{"user": claim.Key}), nil, nil
+		doc, err := renderDoc("User", name, opts.Targets, map[string]any{"user": claim.Key})
+		return doc, nil, err
 	default:
 		return "", nil, nil
 	}
 }
 
+// serviceState records whether a unit is running now. The scan only
+// established that it is enabled; asserting `started` for a oneshot that ran
+// at boot and exited would make the first plan after adoption start it.
+func serviceState(opts GenerateOptions, unit string) string {
+	res, err := opts.Host.Run(context.Background(), "systemctl", "is-active", unit)
+	if err == nil && strings.TrimSpace(res.Stdout) == "active" {
+		return "started"
+	}
+	return "unmanaged"
+}
+
 func generateFile(item Item, filePath string, opts GenerateOptions, used map[string]bool) (string, []string, error) {
+	if skipPath(filePath) {
+		return "", nil, errors.New("secrets and per-machine state are never copied into a repository")
+	}
 	info, err := opts.Host.Stat(filePath)
 	if err != nil {
 		return "", nil, err
+	}
+	if info.Target != "" {
+		// Reading through the link would manage a copy of its target, with
+		// the link's own 0777 as the mode.
+		return "", nil, fmt.Errorf("is a symlink to %s, which a File resource cannot express", info.Target)
+	}
+	if info.IsDir {
+		return "", nil, errors.New("is a directory")
+	}
+	if info.Mode&0o004 == 0 {
+		return "", nil, fmt.Errorf("mode %04o is not world-readable, which usually means it holds a secret, so its contents are not copied into a repository", info.Mode.Perm())
 	}
 	if info.Size > opts.MaxFileBytes {
 		return "", nil, fmt.Errorf("file is %d bytes, above the %d byte limit for generated payloads", info.Size, opts.MaxFileBytes)
@@ -152,66 +208,85 @@ func generateFile(item Item, filePath string, opts GenerateOptions, used map[str
 
 	name := uniqueName(strings.TrimPrefix(filePath, "/"), used)
 	payload := path.Join("files", name)
-	if err := opts.Host.WriteFile(path.Join(opts.Dir, payload), data, 0o644); err != nil {
-		return "", nil, err
-	}
 
-	fields := map[string]string{
+	spec := map[string]any{
 		"path":   filePath,
 		"source": payload,
-		"mode":   "\"0" + strconv.FormatUint(uint64(info.Mode.Perm()), 8) + "\"",
+		"mode":   fmt.Sprintf("%04o", info.Mode.Perm()),
 	}
 	if owner, err := opts.Host.LookupUserName(info.UID); err == nil {
-		fields["owner"] = owner
+		spec["owner"] = owner
 	}
 	if group, err := opts.Host.LookupGroupName(info.GID); err == nil {
-		fields["group"] = group
+		spec["group"] = group
 	}
 
 	kind := "File"
-	if strings.HasPrefix(filePath, "/etc/systemd/system/") {
-		// A unit file is better expressed as the kind that knows to run
-		// daemon-reload after writing it.
+	dir, base := path.Split(filePath)
+	// A unit file is better expressed as the kind that knows to run
+	// daemon-reload after writing it, when that kind can reproduce it
+	// exactly: SystemdUnit always writes mode 0644 and appends ".service" to
+	// a name without a suffix. Drop-ins (foo.service.d/override.conf) keep
+	// their directory.
+	if strings.HasPrefix(filePath, "/etc/systemd/system/") && strings.Contains(base, ".") && info.Mode.Perm() == 0o644 {
 		kind = "SystemdUnit"
-		fields = map[string]string{
-			"unit":   path.Base(filePath),
+		spec = map[string]any{
+			"unit":   base,
 			"source": payload,
 		}
+		if dir = strings.TrimSuffix(dir, "/"); dir != "/etc/systemd/system" {
+			spec["directory"] = dir
+		}
 	}
-	return renderDoc(kind, name, opts.Targets, fields), []string{payload}, nil
+	doc, err := renderDoc(kind, name, opts.Targets, spec)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := opts.Host.WriteFile(path.Join(opts.Dir, payload), data, 0o644); err != nil {
+		return "", nil, err
+	}
+	return doc, []string{payload}, nil
 }
 
-// renderDoc emits one manifest document. Values are written verbatim, so
-// callers quote anything that YAML would otherwise reinterpret (an octal mode
-// being the obvious trap).
-func renderDoc(kind, name string, targets map[string]string, fields map[string]string) string {
-	var b strings.Builder
-	b.WriteString("apiVersion: systemcd.dev/v1\n")
-	fmt.Fprintf(&b, "kind: %s\n", kind)
-	b.WriteString("metadata:\n")
-	fmt.Fprintf(&b, "  name: %s\n", name)
+type generatedDoc struct {
+	APIVersion string            `yaml:"apiVersion"`
+	Kind       string            `yaml:"kind"`
+	Metadata   generatedMetadata `yaml:"metadata"`
+	Spec       map[string]any    `yaml:"spec,omitempty"`
+}
+
+type generatedMetadata struct {
+	Name    string            `yaml:"name"`
+	Targets *generatedTargets `yaml:"targets,omitempty"`
+}
+
+type generatedTargets struct {
+	Labels map[string]string `yaml:"labels"`
+}
+
+// renderDoc emits one manifest document through the YAML encoder, so every
+// value is quoted as it needs to be: an octal mode, a path containing " #" or
+// ": ", or a label value such as "yes" all read back as the string they were.
+func renderDoc(kind, name string, targets map[string]string, spec map[string]any) (string, error) {
+	doc := generatedDoc{
+		APIVersion: "systemcd.dev/v1",
+		Kind:       kind,
+		Metadata:   generatedMetadata{Name: name},
+		Spec:       spec,
+	}
 	if len(targets) > 0 {
-		b.WriteString("  targets:\n    labels:\n")
-		for _, k := range sortedKeys(targets) {
-			fmt.Fprintf(&b, "      %s: %s\n", k, targets[k])
-		}
+		doc.Metadata.Targets = &generatedTargets{Labels: targets}
 	}
-	if len(fields) > 0 {
-		b.WriteString("spec:\n")
-		for _, k := range sortedKeys(fields) {
-			fmt.Fprintf(&b, "  %s: %s\n", k, fields[k])
-		}
+	var b bytes.Buffer
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(2)
+	if err := enc.Encode(doc); err != nil {
+		return "", err
 	}
-	return b.String()
-}
-
-func sortedKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
+	if err := enc.Close(); err != nil {
+		return "", err
 	}
-	sort.Strings(out)
-	return out
+	return b.String(), nil
 }
 
 var unsafeName = regexp.MustCompile(`[^a-z0-9-]+`)
@@ -225,8 +300,15 @@ func uniqueName(raw string, used map[string]bool) string {
 		name = "resource"
 	}
 	if len(name) > 60 {
-		name = name[len(name)-60:]
-		name = strings.TrimLeft(name, "-")
+		// Keep the distinctive end of a long path, starting on a whole
+		// word: "etc-systemd-..." cut mid-word read as "c-systemd-...".
+		cut := len(name) - 60
+		if name[cut-1] != '-' {
+			if i := strings.IndexByte(name[cut:], '-'); i >= 0 {
+				cut += i
+			}
+		}
+		name = strings.TrimLeft(name[cut:], "-")
 	}
 	candidate := name
 	for i := 2; used[candidate]; i++ {

@@ -133,6 +133,22 @@ func Scan(ctx context.Context, opts Options) (*Report, error) {
 	if opts.Limit <= 0 {
 		opts.Limit = DefaultLimit
 	}
+	for _, c := range opts.Categories {
+		if !knownCategory(c) {
+			return nil, fmt.Errorf("inventory: unknown category %q (known: %s)", c, strings.Join(categoryNames(), ", "))
+		}
+	}
+	// A root that was asked for by name and does not exist would scan
+	// nothing and report a clean machine.
+	for _, root := range opts.Paths {
+		info, err := opts.Host.Stat(root)
+		if err != nil {
+			return nil, fmt.Errorf("inventory: path %s: %w", root, err)
+		}
+		if !info.IsDir && info.Target == "" {
+			return nil, fmt.Errorf("inventory: path %s is not a directory", root)
+		}
+	}
 	if len(opts.Paths) == 0 {
 		opts.Paths = []string{"/etc"}
 	}
@@ -160,6 +176,11 @@ func Scan(ctx context.Context, opts Options) (*Report, error) {
 		if err := scan.run(s); err != nil {
 			rep.Skipped = append(rep.Skipped, fmt.Sprintf("%s: %v", scan.category, err))
 		}
+		if s.dropped[scan.category] > 0 {
+			// A capped list that reads as complete understates what is left.
+			rep.Skipped = append(rep.Skipped, fmt.Sprintf("%s: stopped after %d items, %d more not listed (raise --limit)",
+				scan.category, opts.Limit, s.dropped[scan.category]))
+		}
 	}
 
 	sort.SliceStable(rep.Items, func(i, j int) bool {
@@ -169,6 +190,28 @@ func Scan(ctx context.Context, opts Options) (*Report, error) {
 		return rep.Items[i].Claim < rep.Items[j].Claim
 	})
 	return rep, nil
+}
+
+var allCategories = []Category{
+	CategoryModifiedConfig, CategoryUnpackagedConfig, CategoryLocalUnit, CategoryEnabledService,
+	CategoryManualPackage, CategoryLocalUser, CategorySysctlDropIn,
+}
+
+func knownCategory(c Category) bool {
+	for _, known := range allCategories {
+		if c == known {
+			return true
+		}
+	}
+	return false
+}
+
+func categoryNames() []string {
+	out := make([]string, len(allCategories))
+	for i, c := range allCategories {
+		out[i] = string(c)
+	}
+	return out
 }
 
 func (o Options) wants(c Category) bool {
@@ -189,6 +232,7 @@ type scanner struct {
 	report  *Report
 	current Category
 	counts  map[Category]int
+	dropped map[Category]int
 }
 
 // add records a finding, attributing it to a systemcd resource when one
@@ -196,8 +240,10 @@ type scanner struct {
 func (s *scanner) add(item Item) {
 	if s.counts == nil {
 		s.counts = map[Category]int{}
+		s.dropped = map[Category]int{}
 	}
 	if s.counts[item.Category] >= s.opts.Limit {
+		s.dropped[item.Category]++
 		return
 	}
 	s.counts[item.Category]++
@@ -234,24 +280,20 @@ func (s *scanner) modifiedConfigs() error {
 
 func (s *scanner) dpkgVerify() error {
 	// `dpkg -V` prints one line per file that fails verification, in the form
-	// "??5??????   c /etc/nginx/nginx.conf"; position 2 is the checksum flag
-	// and the letter after the flags marks a conffile.
-	res, err := s.opts.Host.Run(s.ctx, "dpkg", "-V")
+	// "??5?????? c /etc/nginx/nginx.conf"; position 2 is the checksum flag
+	// and the letter after the flags marks a conffile. dpkg documents that
+	// the default format may change, so the format is named explicitly.
+	res, err := s.opts.Host.Run(s.ctx, "dpkg", "-V", "--verify-format=rpm")
 	if err != nil {
 		return err
 	}
-	for _, line := range strings.Split(res.Stdout, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		flags, path := fields[0], fields[len(fields)-1]
-		if len(flags) < 3 || flags[2] != '5' {
-			// Only checksum mismatches mean "the contents were edited";
-			// mode and ownership differences are noisier and less certain.
-			continue
-		}
-		if !s.underScanRoots(path) {
+	// dpkg exits 0 even when files fail verification; anything else means
+	// the check did not run, and an empty result would read as "clean".
+	if !res.OK() {
+		return fmt.Errorf("dpkg -V failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	for _, path := range checksumFailures(res.Stdout) {
+		if !s.underScanRoots(path) || skipPath(path) {
 			continue
 		}
 		s.pathItem(CategoryModifiedConfig, path, "contents differ from what the package installed", s.owningPackage(path))
@@ -261,8 +303,9 @@ func (s *scanner) dpkgVerify() error {
 
 func (s *scanner) rpmVerify() error {
 	// `rpm -Va` uses the same convention: position 2 of the flag string is
-	// the digest check.
-	res, err := s.opts.Host.Run(s.ctx, "rpm", "-Va", "--nofiles", "--noscripts")
+	// the digest check. Dependencies and %verifyscript are skipped as slow
+	// and irrelevant; files are what is being verified.
+	res, err := s.opts.Host.Run(s.ctx, "rpm", "-Va", "--nodeps", "--noscripts")
 	if err != nil {
 		return err
 	}
@@ -272,21 +315,45 @@ func (s *scanner) rpmVerify() error {
 			return err
 		}
 	}
-	for _, line := range strings.Split(res.Stdout, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		flags, path := fields[0], fields[len(fields)-1]
-		if len(flags) < 3 || flags[2] != '5' {
-			continue
-		}
-		if !s.underScanRoots(path) {
+	// rpm exits non-zero when any file differs, so only a failure that
+	// produced no report at all means the check did not run.
+	if !res.OK() && strings.TrimSpace(res.Stdout) == "" {
+		return fmt.Errorf("rpm -Va failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	for _, path := range checksumFailures(res.Stdout) {
+		if !s.underScanRoots(path) || skipPath(path) {
 			continue
 		}
 		s.pathItem(CategoryModifiedConfig, path, "contents differ from what the package installed", "")
 	}
 	return nil
+}
+
+// checksumFailures extracts the paths whose digest check failed from rpm-style
+// verify output: "S.5....T.  c /etc/foo", "??5?????? c /etc/foo". The path is
+// everything from the first " /" after the flags, so a name containing spaces
+// survives intact.
+func checksumFailures(out string) []string {
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		flags := fields[0]
+		if len(flags) < 3 || flags[2] != '5' {
+			// Only checksum mismatches mean "the contents were edited";
+			// mode and ownership differences are noisier and less certain.
+			continue
+		}
+		rest := strings.TrimLeft(line, " \t")[len(flags):]
+		i := strings.Index(rest, " /")
+		if i < 0 {
+			continue
+		}
+		paths = append(paths, rest[i+1:])
+	}
+	return paths
 }
 
 // unpackagedConfigs finds files under the scan roots that no package owns.
@@ -307,7 +374,11 @@ func (s *scanner) unpackagedConfigs() error {
 			if skipPath(path) {
 				continue
 			}
-			if s.ownedByPackage(path, haveDpkg) {
+			owned, err := s.ownedByPackage(path, haveDpkg)
+			if err != nil {
+				return err
+			}
+			if owned {
 				continue
 			}
 			s.pathItem(CategoryUnpackagedConfig, path, "no package owns this file", "")
@@ -337,6 +408,13 @@ func (s *scanner) walk(dir string, depth int) ([]string, error) {
 		if err != nil {
 			continue
 		}
+		if info.Target != "" {
+			// A symlink is not configuration content: /etc/resolv.conf,
+			// /etc/localtime and the *.wants links `systemctl enable`
+			// writes. Reading through one would offer the target's bytes,
+			// and a mode of 0777, as a file to manage.
+			continue
+		}
 		if info.IsDir {
 			nested, err := s.walk(full, depth+1)
 			if err != nil {
@@ -350,17 +428,42 @@ func (s *scanner) walk(dir string, depth int) ([]string, error) {
 	return out, nil
 }
 
-func (s *scanner) ownedByPackage(path string, haveDpkg bool) bool {
+func (s *scanner) ownedByPackage(path string, haveDpkg bool) (bool, error) {
 	if haveDpkg {
-		res, err := s.opts.Host.Run(s.ctx, "dpkg-query", "-S", path)
-		return err == nil && res.OK()
+		res, err := s.opts.Host.Run(s.ctx, "dpkg-query", "-S", dpkgLiteral(path))
+		if err != nil {
+			return false, err
+		}
+		// Exit 1 is "no package owns it"; 2 and above is dpkg-query itself
+		// failing, and treating that as "unowned" would list all of /etc.
+		if res.ExitCode > 1 {
+			return false, fmt.Errorf("dpkg-query -S failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+		return res.OK(), nil
 	}
 	res, err := s.opts.Host.Run(s.ctx, "rpm", "-qf", path)
-	return err == nil && res.OK()
+	if err != nil {
+		return false, err
+	}
+	return res.OK(), nil
+}
+
+// dpkgLiteral escapes a path for `dpkg-query -S`, which treats its argument
+// as a glob: /etc/foo[1].conf would otherwise be looked up as a pattern.
+func dpkgLiteral(path string) string {
+	var b strings.Builder
+	for _, r := range path {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func (s *scanner) owningPackage(path string) string {
-	res, err := s.opts.Host.Run(s.ctx, "dpkg-query", "-S", path)
+	res, err := s.opts.Host.Run(s.ctx, "dpkg-query", "-S", dpkgLiteral(path))
 	if err != nil || !res.OK() {
 		return ""
 	}
@@ -386,9 +489,22 @@ func (s *scanner) localUnits() error {
 		if !strings.Contains(name, ".") || strings.HasSuffix(name, ".wants") || strings.HasSuffix(name, ".d") {
 			continue
 		}
+		// Only regular files are units somebody wrote. Symlinks here are
+		// aliases created by `systemctl enable` or masks pointing at
+		// /dev/null, and directories are .requires/.upholds link farms.
+		if !s.regularFile(dir + "/" + name) {
+			continue
+		}
 		s.pathItem(CategoryLocalUnit, dir+"/"+name, "unit installed locally rather than by a package", "")
 	}
 	return nil
+}
+
+// regularFile reports whether path exists and is neither a directory nor a
+// symlink.
+func (s *scanner) regularFile(path string) bool {
+	info, err := s.opts.Host.Stat(path)
+	return err == nil && !info.IsDir && info.Target == ""
 }
 
 // enabledServices lists what starts at boot.
@@ -423,6 +539,9 @@ func (s *scanner) manualPackages() error {
 		if err != nil {
 			return err
 		}
+		if !res.OK() {
+			return fmt.Errorf("apt-mark showmanual failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
 		for _, name := range strings.Fields(res.Stdout) {
 			s.add(Item{
 				Category: CategoryManualPackage,
@@ -436,6 +555,9 @@ func (s *scanner) manualPackages() error {
 		res, err := s.opts.Host.Run(s.ctx, "dnf", "repoquery", "--userinstalled", "--qf", "%{name}")
 		if err != nil {
 			return err
+		}
+		if !res.OK() {
+			return fmt.Errorf("dnf repoquery failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 		}
 		for _, name := range strings.Fields(res.Stdout) {
 			s.add(Item{
@@ -491,7 +613,9 @@ func (s *scanner) sysctlDropIns() error {
 		return err
 	}
 	for _, name := range names {
-		if !strings.HasSuffix(name, ".conf") {
+		// Debian's 99-sysctl.conf is a symlink to ../sysctl.conf; the file
+		// it points at is reported where it lives.
+		if !strings.HasSuffix(name, ".conf") || !s.regularFile(dir+"/"+name) {
 			continue
 		}
 		s.pathItem(CategorySysctlDropIn, dir+"/"+name, "kernel parameter drop-in", "")
@@ -517,6 +641,9 @@ func skipPath(path string) bool {
 		"/etc/alternatives/", "/etc/rc0.d/", "/etc/rc1.d/", "/etc/rc2.d/",
 		"/etc/rc3.d/", "/etc/rc4.d/", "/etc/rc5.d/", "/etc/rc6.d/", "/etc/rcS.d/",
 		"/etc/apparmor.d/cache/", "/etc/ld.so.cache",
+		// Per-machine identity and clock state: copying these across a
+		// fleet would clone them onto every host.
+		"/etc/machine-id", "/etc/hostname", "/etc/adjtime", "/etc/.pwd.lock",
 	}
 	for _, prefix := range noisy {
 		if strings.HasPrefix(path, prefix) {
@@ -524,14 +651,25 @@ func skipPath(path string) bool {
 		}
 	}
 	// Secrets and live credential stores do not belong in a git repository,
-	// so inventory does not invite anyone to put them there.
-	secrets := []string{"/etc/shadow", "/etc/gshadow", "/etc/sudoers.d/", "/etc/ssh/ssh_host_"}
+	// so inventory does not invite anyone to put them there. The account
+	// database backups (passwd-, group-, ...) are included with the
+	// databases.
+	secrets := []string{
+		"/etc/shadow", "/etc/gshadow", "/etc/passwd-", "/etc/group-", "/etc/subuid-", "/etc/subgid-",
+		"/etc/sudoers", "/etc/security/opasswd", "/etc/ssh/ssh_host_", "/etc/ssl/private/",
+		"/etc/letsencrypt/", "/etc/wireguard/", "/etc/NetworkManager/system-connections/",
+		"/etc/krb5.keytab", "/etc/ipsec.secrets", "/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets",
+	}
 	for _, prefix := range secrets {
 		if strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}
-	suffixes := []string{".dpkg-old", ".dpkg-dist", ".rpmnew", ".rpmsave", ".bak", "~", ".swp"}
+	// Key material, wherever it lives. A .pem may only be a certificate,
+	// but guessing wrong in that direction costs a line in a report, not a
+	// private key in git.
+	suffixes := []string{".key", ".pem", ".p12", ".pfx", ".keytab",
+		".dpkg-old", ".dpkg-dist", ".rpmnew", ".rpmsave", ".bak", "~", ".swp"}
 	for _, suffix := range suffixes {
 		if strings.HasSuffix(path, suffix) {
 			return true
