@@ -123,6 +123,12 @@ is the handler mechanism: the notifier is *ordered before* its target, so the
 new config is always on disk before the reload fires — and a service the same
 run just started is not then also restarted.
 
+A refresh that cannot be delivered is not forgotten. If the target fails, is
+skipped because something it depends on failed, or is left out by `--only`,
+the refresh is recorded in state as owed and delivered by the next run that
+reaches the target. Without that, the reload would be lost for good: by the
+next run the config file that asked for it is already in sync.
+
 ## Resource kinds
 
 | Kind | Manages | Notable spec fields |
@@ -137,6 +143,13 @@ run just started is not then also restarted.
 | `Exec` | escape hatch, guarded for idempotency | `command` / `argv`, `creates`, `unless`, `onlyIf`, `refreshOnly` |
 
 `systemcd kinds` lists them at runtime.
+
+A `File` that sets neither `content` nor `source` manages only the file's
+mode and ownership: it is created empty if missing, and its existing contents
+are left alone. `content: ""` is different, and empties the file.
+
+Resource names end up in file names and `Kind/name` references, so they must
+be a single path component: no `/`, no `..`, no whitespace.
 
 **† `version` is only accepted where it can be honored.** apt, dnf, yum and
 zypper can install an exact version, downgrade to it, and read the installed
@@ -171,6 +184,11 @@ spec:
 something if a resource can report whether it's already satisfied, so
 `creates:`, `unless:`, `onlyIf:`, or `refreshOnly:` is mandatory — with
 `always: true` as the explicit, visible opt-out.
+
+`unless:` and `onlyIf:` run during `plan` too, because a plan cannot say
+whether the command is due without asking them. Keep guards read-only. The
+command itself never runs in a plan, runs at most once per reconcile even
+when it is both due and notified, and a notify does not bypass its guards.
 
 ## Commands
 
@@ -228,10 +246,11 @@ unpackaged-config (1)
 ```
 
 That first list is, literally, the changes nobody wrote down. Secrets
-(`/etc/shadow`, host keys, `sudoers.d`) and churn (`.dpkg-old`, cert stores)
-are excluded — an inventory that invites you to commit `/etc/shadow` is worse
-than none. A scan that cannot run says so rather than reporting a clean
-machine.
+(`/etc/shadow`, `/etc/sudoers`, host keys, private keys under
+`/etc/ssl/private`, `*.key`/`*.pem`, WireGuard and NetworkManager secrets)
+and churn (`.dpkg-old`, cert stores, `machine-id`) are excluded — an
+inventory that invites you to commit `/etc/shadow` is worse than none. A scan
+that cannot run says so rather than reporting a clean machine.
 
 **2. Turn it into a starting point.**
 
@@ -241,7 +260,10 @@ systemcd inventory --generate ./fleet --generate-label role=app
 
 Writes `manifests/discovered.yaml` plus the extracted file payloads under
 `files/`. It is a snapshot of what *is*, not a claim about what *should be* —
-turning one into the other is your judgement, not the tool's.
+turning one into the other is your judgement, not the tool's. Symlinks,
+secrets and files that are not world-readable are never extracted; they are
+listed as skipped instead. An existing `discovered.yaml` is not overwritten.
+The generated repository plans as in sync on the host it came from.
 
 **3. Take ownership without changing anything.**
 
@@ -312,6 +334,11 @@ mean something different in a patch than in a base. `dependsOn` and `notify`
 append, because a patch that narrows a resource must not silently drop
 ordering the base established.
 
+A patch can be scoped more widely than its target: on a host that does not
+get the target, the patch has nothing to narrow and does nothing. A patch
+whose target exists nowhere in the repository is an error, and so is one
+whose `patch:` is not a mapping.
+
 What this deliberately is not:
 
 ```yaml
@@ -367,6 +394,10 @@ metadata:
 Labels come from, in increasing precedence: the repo's `Config`,
 `/etc/systemcd/node.yaml` on the machine, and `--label` on the command line.
 
+Misspelled fields outside `spec` are errors, not silently ignored. A
+`target:` or `label:` typo would otherwise drop the scoping and ship a
+database-only resource to every host.
+
 ## Ownership
 
 The thing that determines whether you trust this on a production machine is
@@ -388,6 +419,11 @@ systemcd: conflicting ownership:
 
 `Exec` claims nothing, which is the honest description of an escape hatch —
 and the reason it needs a guard.
+
+`validate` checks claims across the whole repository. Two resources may claim
+the same thing when their label targets can never meet on one host (one
+requires `role: web`, the other `role: db`); hostname globs are assumed to
+overlap.
 
 **Adoption is recorded, not assumed.** A file systemcd created and a file it
 took over from a distro package are different situations, and the second one
@@ -468,6 +504,13 @@ its stored manifest and asking it to delete itself. Two guard rails:
 - **`--only` disables pruning and orphan reporting entirely.** Ownership
   cannot be judged from a partial view; if prune ran under `--only` it would
   delete most of the machine.
+- **A renamed resource is never pruned out from under its new name.** An old
+  record whose path, package or account a declared resource now claims is
+  kept and reported, not deleted; `systemcd release <old>` drops it without
+  touching the host.
+- **Retiring an absence removes nothing.** Pruning a resource that only said
+  something must not exist (`state: absent`) drops the record; it does not
+  delete whatever has appeared there since.
 
 ### State storage
 
@@ -489,7 +532,9 @@ treated like one:
 ## Safety properties
 
 - **Plans never mutate.** `DryRun` is threaded to every provider; the tests
-  assert the host is untouched and no state is written.
+  assert the host is untouched and no state is written. The one thing a plan
+  runs that you wrote is an `Exec` guard (`unless:`, `onlyIf:`), so keep
+  those read-only.
 - **Files are replaced atomically** — write to a temp file in the same
   directory, `fsync`, `rename` — so no reader ever sees a half-written config.
 - **Overwrites are backed up** to `/var/lib/systemcd/backups/` first.
@@ -498,7 +543,11 @@ treated like one:
   while unrelated branches still converge.
 - **Post-apply health checks.** A service that comes back `failed` is reported
   `Degraded` with the journal tail, and the command exits non-zero.
-- **`sensitive: true`** keeps a file's hash and diff out of plan output.
+- **`sensitive: true`** keeps a file's hash and diff out of plan, `show` and
+  restore previews, and its inline `content` out of the state file.
+- **Symlinks are not followed.** A managed path that turns out to be a link
+  is reported and replaced, never read through, chmodded through or copied
+  into a backup.
 
 ## Design notes
 
@@ -541,7 +590,8 @@ patches, content diffs, pause, metrics, rollback, locking, and the agent.
 Not there yet:
 
 - **Secret backends.** `sensitive: true` keeps values out of output and state,
-  but the value still lives in git. Real secret references are the next gap.
+  but the value still lives in git, and in the checkout under
+  `/var/lib/systemcd`. Real secret references are the next gap.
 - **A fleet-wide view.** Everything here is per-host by design; correlating
   400 machines currently means scraping the metrics or the `--json`.
 - **`Timer`, `Mount`, `Firewall` kinds**, and `Exec` health verification.
