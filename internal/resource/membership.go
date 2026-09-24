@@ -51,6 +51,14 @@ func (g *GroupMembership) UnmarshalYAML(node *yaml.Node) error {
 		g.Ensure, g.Mode = list, MembershipAdditive
 		return nil
 	case yaml.MappingNode:
+		// The strict decoder behind DecodeSpec does not reach into a custom
+		// unmarshaler, so check the keys here: a typo such as `mod: exact`
+		// would otherwise silently leave the list additive.
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if key := node.Content[i].Value; key != "ensure" && key != "mode" {
+				return fmt.Errorf("groups: unknown field %q (want `ensure` and `mode`)", key)
+			}
+		}
 		// A named type avoids recursing into this method.
 		type raw GroupMembership
 		var out raw
@@ -79,5 +87,20 @@ func (g *GroupMembership) normalize() error {
 	if g.Mode == MembershipExact && len(g.Ensure) == 0 {
 		return fmt.Errorf("spec.groups.mode: exact with an empty list would remove every supplementary group; list them explicitly or use `mode: additive`")
 	}
+	// Names are joined with commas for usermod and compared against the
+	// names `id -nG` prints, so each must be a plain group name, and a
+	// repeated one would never match the host's de-duplicated list.
+	seen := map[string]bool{}
+	ensure := make([]string, 0, len(g.Ensure))
+	for _, name := range g.Ensure {
+		if err := checkAccountName("spec.groups", name, false); err != nil {
+			return err
+		}
+		if !seen[name] {
+			seen[name] = true
+			ensure = append(ensure, name)
+		}
+	}
+	g.Ensure = ensure
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/vikki8/systemcd/internal/manifest"
 )
@@ -55,14 +56,31 @@ func (u *User) ID() ID { return ID{Kind: "User", Name: u.name} }
 
 func (u *User) Validate() error {
 	u.user = u.spec.User
+	field := "spec.user"
 	if u.user == "" {
 		u.user = u.name
+		field = "metadata.name"
+	}
+	if err := checkAccountName(field, u.user, false); err != nil {
+		return err
 	}
 	state, err := normalizePresence(u.spec.State)
 	if err != nil {
 		return err
 	}
 	u.spec.State = state
+	if u.spec.UID != nil && !validID(*u.spec.UID) {
+		return fmt.Errorf("spec.uid %d is out of range", *u.spec.UID)
+	}
+	if u.spec.Group != "" {
+		// usermod and useradd take the primary group by name or by gid.
+		if err := checkAccountName("spec.group", u.spec.Group, true); err != nil {
+			return err
+		}
+	}
+	if u.spec.Home != "" && !strings.HasPrefix(u.spec.Home, "/") {
+		return fmt.Errorf("spec.home %q must be an absolute path", u.spec.Home)
+	}
 	if u.spec.Shell != "" && !strings.HasPrefix(u.spec.Shell, "/") {
 		return fmt.Errorf("spec.shell %q must be an absolute path", u.spec.Shell)
 	}
@@ -76,6 +94,12 @@ func (u *User) Desired(c *Context) (State, error) {
 	}
 	if u.spec.UID != nil {
 		s["uid"] = strconv.Itoa(*u.spec.UID)
+	}
+	// The primary group is reconciled, not just passed to useradd: a field
+	// that is honored at creation and then never checked again is drift
+	// nobody can see.
+	if u.spec.Group != "" {
+		s["group"] = u.spec.Group
 	}
 	if u.spec.Home != "" {
 		s["home"] = u.spec.Home
@@ -107,6 +131,13 @@ func (u *User) Observe(c *Context) (State, error) {
 		s["shell"] = fields[6]
 		s["_gid"] = fields[3]
 	}
+	if u.spec.Group != "" && s["_gid"] != "" {
+		group, err := u.observePrimaryGroup(c, s["_gid"])
+		if err != nil {
+			return nil, err
+		}
+		s["group"] = group
+	}
 
 	if !u.spec.Groups.Empty() {
 		groups, err := u.observeGroups(c, s["_gid"])
@@ -131,7 +162,11 @@ func (u *User) observeGroups(c *Context, primaryGID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !res.OK() {
+	// id exits 1 when one of the account's gids has no name (typically a
+	// primary group deleted out from under it) but still prints the list,
+	// with the bare number in that slot. Reading that as "no groups" would
+	// rerun the same usermod on every reconcile without ever converging.
+	if !res.OK() && strings.TrimSpace(res.Stdout) == "" {
 		return "", nil
 	}
 	have := strings.Fields(res.Stdout)
@@ -152,19 +187,52 @@ func (u *User) observeGroups(c *Context, primaryGID string) (string, error) {
 
 	primary := ""
 	if primaryGID != "" {
-		if entry, found, err := getent(c, "group", primaryGID); err == nil && found {
-			if fields := strings.Split(entry, ":"); len(fields) > 0 {
-				primary = fields[0]
-			}
-		}
+		primary = groupNameOf(c, primaryGID)
+	}
+	wanted := map[string]bool{}
+	for _, g := range u.spec.Groups.Ensure {
+		wanted[g] = true
 	}
 	supplementary := make([]string, 0, len(have))
 	for _, g := range have {
-		if g != primary {
+		// id prints the primary group once even when the account is also a
+		// listed member of it, so a primary group named in `ensure` can only
+		// ever be observed as the primary: count it as present.
+		if g != primary || wanted[g] {
 			supplementary = append(supplementary, g)
 		}
 	}
 	return normalizeList(supplementary), nil
+}
+
+// observePrimaryGroup reports the account's primary group in the manifest's
+// own terms: the declared name or gid when it resolves to the gid the account
+// has, and otherwise whatever is there.
+func (u *User) observePrimaryGroup(c *Context, gid string) (string, error) {
+	if u.spec.Group == gid {
+		return gid, nil
+	}
+	entry, found, err := getent(c, "group", u.spec.Group)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		if fields := strings.Split(entry, ":"); len(fields) >= 3 && fields[2] == gid {
+			return u.spec.Group, nil
+		}
+	}
+	return groupNameOf(c, gid), nil
+}
+
+// groupNameOf resolves a gid to its group name, falling back to the number
+// itself, which is also what `id -nG` prints for a gid with no name.
+func groupNameOf(c *Context, gid string) string {
+	if entry, found, err := getent(c, "group", gid); err == nil && found {
+		if name, _, _ := strings.Cut(entry, ":"); name != "" {
+			return name
+		}
+	}
+	return gid
 }
 
 func (u *User) Apply(c *Context, d Diff) error {
@@ -208,6 +276,9 @@ func (u *User) Apply(c *Context, d Diff) error {
 	var mod []string
 	if d.Has("uid") && u.spec.UID != nil {
 		mod = append(mod, "--uid", strconv.Itoa(*u.spec.UID))
+	}
+	if d.Has("group") && u.spec.Group != "" {
+		mod = append(mod, "--gid", u.spec.Group)
 	}
 	if d.Has("home") && u.spec.Home != "" {
 		mod = append(mod, "--home", u.spec.Home)
@@ -282,14 +353,22 @@ func (g *Group) ID() ID { return ID{Kind: "Group", Name: g.name} }
 
 func (g *Group) Validate() error {
 	g.group = g.spec.Group
+	field := "spec.group"
 	if g.group == "" {
 		g.group = g.name
+		field = "metadata.name"
+	}
+	if err := checkAccountName(field, g.group, false); err != nil {
+		return err
 	}
 	state, err := normalizePresence(g.spec.State)
 	if err != nil {
 		return err
 	}
 	g.spec.State = state
+	if g.spec.GID != nil && !validID(*g.spec.GID) {
+		return fmt.Errorf("spec.gid %d is out of range", *g.spec.GID)
+	}
 	return nil
 }
 
@@ -378,6 +457,39 @@ func run(c *Context, name string, args ...string) error {
 		return fmt.Errorf("%s %s: exit %d: %s", name, strings.Join(args, " "), res.ExitCode, firstLine(res.Stderr, res.Stdout))
 	}
 	return nil
+}
+
+// checkAccountName rejects names the account tools would read as something
+// else. A leading '-' is parsed as an option (`useradd … -h` prints its help
+// and exits 0, so the account is reported created without existing); an
+// all-digit name makes getent and usermod look up an id instead; ':' ',' '/'
+// and whitespace break the list and file formats the name is written into.
+// allowNumeric admits a bare id where the tools take one (a primary gid).
+func checkAccountName(field, name string, allowNumeric bool) error {
+	if name == "" {
+		return fmt.Errorf("%s: a name is required", field)
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("%s: %q is not a valid account name", field, name)
+	}
+	if strings.ContainsAny(name[:1], "-+~") {
+		return fmt.Errorf("%s: %q must not start with %q", field, name, name[:1])
+	}
+	for _, r := range name {
+		if r == ':' || r == ',' || r == '/' || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("%s: %q contains %q, which is not allowed in an account name", field, name, r)
+		}
+	}
+	if _, err := strconv.ParseUint(name, 10, 64); err == nil && !allowNumeric {
+		return fmt.Errorf("%s: %q is all digits, which the account tools read as a numeric id; use a name", field, name)
+	}
+	return nil
+}
+
+// validID reports whether id is usable as a uid or gid. 4294967295 is
+// (uid_t)-1, which chown and the account tools treat as "no id".
+func validID(id int) bool {
+	return id >= 0 && int64(id) < 1<<32-1
 }
 
 // normalizeList renders a set as a stable, comparable string.
