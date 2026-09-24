@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"time"
 
@@ -104,9 +105,17 @@ type Snapshot struct {
 	Revision  string            `json:"revision,omitempty"`
 	UpdatedAt time.Time         `json:"updatedAt"`
 	Resources map[string]Record `json:"resources"`
+	// Changed is how many resources the last apply at Revision changed, kept
+	// so the history entry written when Revision moves on can say so.
+	Changed int `json:"changed,omitempty"`
 	// History holds the revisions applied before the current one, newest
 	// first, so `rollback` has somewhere to go.
 	History []HistoryEntry `json:"history,omitempty"`
+	// PendingRefresh lists resources owed a notify-driven refresh that an
+	// earlier run could not deliver: the target failed, was skipped, or was
+	// left out by --only. Without this the refresh is lost for good, since
+	// by the next run the notifier that changed is already in sync.
+	PendingRefresh []string `json:"pendingRefresh,omitempty"`
 }
 
 // HistoryEntry records one successful apply.
@@ -141,6 +150,10 @@ func (s *Store) warn(format string, args ...any) {
 // backupPath is the previous good state, kept so a truncated or corrupt write
 // does not cost the operator every ownership record on the machine.
 func (s *Store) backupPath() string { return s.Path + ".bak" }
+
+// corruptPath holds a state file that could not be parsed, set aside rather
+// than overwritten, since it may still be recoverable by hand.
+func (s *Store) corruptPath() string { return s.Path + ".corrupt" }
 
 // Load reads the snapshot, returning an empty one when no state exists yet.
 //
@@ -194,24 +207,45 @@ func (s *Store) load(path string) (*Snapshot, error) {
 	if snap.Resources == nil {
 		snap.Resources = map[string]Record{}
 	}
-	migrate(&snap)
+	migrate(&snap, data)
 	return &snap, nil
 }
 
-// migrate brings an older snapshot up to the current schema.
-func migrate(snap *Snapshot) {
+// migrate brings an older snapshot, parsed from data, up to the current
+// schema.
+func migrate(snap *Snapshot, data []byte) {
 	if snap.Version >= Version {
 		return
 	}
-	// v1 had no ownership timestamps. Backfilling them from the file's own
-	// UpdatedAt is the most honest guess available: it is when the record was
-	// last written, and marking these as adopted would be a fabrication.
+	// v1 kept the state it had applied under "desired" and when under
+	// "appliedAt". The first is exactly what drift attribution compares the
+	// host against, and the second is the real last-applied time, so both
+	// carry over. The bytes already parsed as a Snapshot; if this shape does
+	// not fit them, the fields simply stay empty and fall back below.
+	var v1 struct {
+		Resources map[string]struct {
+			Desired   map[string]string `json:"desired"`
+			AppliedAt time.Time         `json:"appliedAt"`
+		} `json:"resources"`
+	}
+	_ = json.Unmarshal(data, &v1)
+
+	// v1 had no first-applied time or adoption flag. The earliest time the
+	// record proves it was applied is the most honest guess available, and
+	// marking these as adopted would be a fabrication.
 	for ref, rec := range snap.Resources {
+		old := v1.Resources[ref]
+		if len(rec.Applied) == 0 {
+			rec.Applied = old.Desired
+		}
+		if rec.LastAppliedAt.IsZero() {
+			rec.LastAppliedAt = old.AppliedAt
+		}
 		if rec.LastAppliedAt.IsZero() {
 			rec.LastAppliedAt = snap.UpdatedAt
 		}
 		if rec.FirstAppliedAt.IsZero() {
-			rec.FirstAppliedAt = snap.UpdatedAt
+			rec.FirstAppliedAt = rec.LastAppliedAt
 		}
 		snap.Resources[ref] = rec
 	}
@@ -230,15 +264,27 @@ func (s *Store) Save(snap *Snapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := s.Host.MkdirAll(paths.DataDir, 0o700); err != nil {
+	if err := s.Host.MkdirAll(path.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
 
 	// Rotate before overwriting so a crash mid-write leaves a recoverable
 	// copy behind.
 	if prev, err := s.Host.ReadFile(s.Path); err == nil {
-		if err := s.Host.WriteFile(s.backupPath(), prev, 0o600); err != nil {
-			s.warn("could not rotate state backup: %v", err)
+		var probe Snapshot
+		if json.Unmarshal(prev, &probe) == nil {
+			if err := s.Host.WriteFile(s.backupPath(), prev, 0o600); err != nil {
+				s.warn("could not rotate state backup: %v", err)
+			}
+		} else {
+			// A torn file is not a backup. Rotating it over the good copy
+			// Load recovered from would leave nothing usable if this write
+			// fails too, so keep it aside for inspection instead.
+			if err := s.Host.WriteFile(s.corruptPath(), prev, 0o600); err != nil {
+				s.warn("could not keep a copy of the corrupt state file at %s: %v", s.corruptPath(), err)
+			} else {
+				s.warn("kept a copy of the corrupt state file at %s", s.corruptPath())
+			}
 		}
 	} else if !errors.Is(err, host.ErrNotExist) {
 		s.warn("could not read state for rotation: %v", err)
@@ -253,22 +299,31 @@ func (s *Store) Save(snap *Snapshot) error {
 // the same machine at once would interleave writes and race each other's
 // state, so the second one waits its turn or gives up.
 func (s *Store) Lock() (func() error, error) {
-	return s.Host.TryLock(paths.LockFile)
+	return s.Host.TryLock(s.LockPath())
 }
+
+// LockPath is the file Lock takes: next to the state file it protects, which
+// for the default store is paths.LockFile.
+func (s *Store) LockPath() string { return path.Join(path.Dir(s.Path), path.Base(paths.LockFile)) }
 
 // RecordApply updates the snapshot after a successful reconcile.
 func (snap *Snapshot) RecordApply(revision string, changed int) {
-	if revision != "" && revision != snap.Revision {
+	if revision == "" {
+		return
+	}
+	// Before the first apply there is no previous revision to remember.
+	if revision != snap.Revision && snap.Revision != "" {
 		snap.History = append([]HistoryEntry{{
 			Revision:  snap.Revision,
 			AppliedAt: snap.UpdatedAt,
-			Changed:   changed,
+			Changed:   snap.Changed,
 		}}, snap.History...)
 		if len(snap.History) > maxHistory {
 			snap.History = snap.History[:maxHistory]
 		}
-		snap.Revision = revision
 	}
+	snap.Revision = revision
+	snap.Changed = changed
 }
 
 // PreviousRevision returns the most recent revision before the current one.

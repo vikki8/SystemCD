@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/vikki8/systemcd/internal/host"
@@ -98,9 +98,9 @@ func Adopt(ctx context.Context, opts AdoptOptions) (*Report, error) {
 	return report, nil
 }
 
-func adoptOne(rc *resource.Context, n *node, snap *state.Snapshot, opts AdoptOptions) Result {
+func adoptOne(rc *resource.Context, n *node, snap *state.Snapshot, opts AdoptOptions) (out Result) {
 	start := time.Now()
-	out := Result{ID: n.id, Source: n.doc.Location(), Owner: ownershipOf(snap, n.id)}
+	out = Result{ID: n.id, Source: n.doc.Location(), Owner: ownershipOf(snap, n.id)}
 	out.Owner.Claims = resource.ClaimStrings(resource.ClaimsOf(n.res))
 	defer func() { out.Duration = time.Since(start) }()
 
@@ -150,7 +150,7 @@ func adoptOne(rc *resource.Context, n *node, snap *state.Snapshot, opts AdoptOpt
 		return out
 	}
 
-	raw, err := yaml.Marshal(n.doc)
+	raw, err := storedManifest(n)
 	if err != nil {
 		out.Action, out.Err = ActionError, err
 		return out
@@ -200,8 +200,45 @@ func captureBaseline(rc *resource.Context, res resource.Resource, id resource.ID
 	return dest, nil
 }
 
+// baselineName maps a resource to one file name under the baseline
+// directory. The name is percent-escaped rather than having '/' replaced, so
+// it stays a single path element and "a/b" and "a_b" cannot share a baseline;
+// kinds contain no '_', so the first one always ends the kind.
 func baselineName(id resource.ID) string {
-	return strings.ReplaceAll(id.Kind+"_"+id.Name, "/", "_")
+	return id.Kind + "_" + url.PathEscape(id.Name)
+}
+
+// storedManifest renders the document kept in state, from which prune and
+// release rebuild the resource. For a sensitive resource the inline content
+// is left out: state must not hold the value (README), and neither deleting
+// nor restoring needs it.
+func storedManifest(n *node) ([]byte, error) {
+	doc := n.doc
+	if len(sensitiveOf(n.res)) > 0 {
+		cp := *doc
+		cp.Spec = withoutKey(doc.Spec, "content")
+		doc = &cp
+	}
+	return yaml.Marshal(doc)
+}
+
+// withoutKey returns a copy of a mapping node without one key.
+func withoutKey(spec yaml.Node, key string) yaml.Node {
+	m := &spec
+	if m.Kind == yaml.DocumentNode && len(m.Content) > 0 {
+		m = m.Content[0]
+	}
+	if m.Kind != yaml.MappingNode {
+		return spec
+	}
+	out := *m
+	out.Content = nil
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value != key {
+			out.Content = append(out.Content, m.Content[i], m.Content[i+1])
+		}
+	}
+	return out
 }
 
 func sensitiveOf(r resource.Resource) map[string]bool {
@@ -262,10 +299,14 @@ func Release(ctx context.Context, opts ReleaseOptions) (*Report, error) {
 
 	// Anything the repository still declares for this node is "live", and
 	// releasing it without --force would be undone on the next reconcile.
+	// Targeting alone decides that: patches only narrow a declared resource,
+	// and a patch that fails to apply must not make the repository look empty.
 	live := map[string]bool{}
 	if opts.Repo != nil {
-		for _, doc := range opts.Repo.SelectFor(opts.Node) {
-			live[doc.Ref()] = true
+		for _, doc := range opts.Repo.Documents {
+			if doc.Kind != manifest.PatchKind && doc.Metadata.Targets.Matches(opts.Node) {
+				live[doc.Ref()] = true
+			}
 		}
 	}
 
@@ -296,10 +337,10 @@ func Release(ctx context.Context, opts ReleaseOptions) (*Report, error) {
 	return report, nil
 }
 
-func releaseOne(rc *resource.Context, ref string, snap *state.Snapshot, live map[string]bool, opts ReleaseOptions) Result {
+func releaseOne(rc *resource.Context, ref string, snap *state.Snapshot, live map[string]bool, opts ReleaseOptions) (out Result) {
 	start := time.Now()
 	id := idFromRef(ref)
-	out := Result{ID: id, Source: "state", Owner: ownershipOf(snap, id)}
+	out = Result{ID: id, Source: "state", Owner: ownershipOf(snap, id)}
 	defer func() { out.Duration = time.Since(start) }()
 
 	rec, owned := snap.Resources[ref]
@@ -346,7 +387,7 @@ func releaseOne(rc *resource.Context, ref string, snap *state.Snapshot, live map
 			out.Messages = []string{"systemcd created this resource rather than adopting it, so there is no earlier state to restore; use --preserve, or remove it from the repository and prune"}
 			return out
 		}
-		out.Diff = restoreDiff(rec)
+		out.Diff = restoreDiff(rec, sensitiveOf(res))
 
 		if !opts.DryRun {
 			var messages []string
@@ -393,23 +434,25 @@ func releaseOne(rc *resource.Context, ref string, snap *state.Snapshot, live map
 
 // restoreDiff renders the restore as a diff from what systemcd applied back
 // to what was there before, so `--dry-run` shows the actual consequence.
-func restoreDiff(rec state.Record) resource.Diff {
+//
+// Only fields systemcd applied are listed: a field the manifest never
+// managed (a Service's `enabled` left unset, `state: unmanaged`) was not
+// changed by systemcd, and restore leaves it alone. Sensitive fields are
+// marked so their values are not printed.
+func restoreDiff(rec state.Record, sensitive map[string]bool) resource.Diff {
 	var out resource.Diff
 	seen := map[string]bool{}
 	for _, k := range sortedStateKeys(rec.PriorState) {
 		seen[k] = true
-		if rec.Applied[k] == rec.PriorState[k] {
+		have, applied := rec.Applied[k]
+		if !applied || have == rec.PriorState[k] {
 			continue
 		}
-		have := rec.Applied[k]
-		if have == "" {
-			have = "<absent>"
-		}
-		out = append(out, resource.FieldDiff{Field: k, Have: have, Want: rec.PriorState[k]})
+		out = append(out, resource.FieldDiff{Field: k, Have: have, Want: rec.PriorState[k], Sensitive: sensitive[k]})
 	}
 	for _, k := range sortedStateKeys(rec.Applied) {
 		if !seen[k] {
-			out = append(out, resource.FieldDiff{Field: k, Have: rec.Applied[k], Want: "<absent>"})
+			out = append(out, resource.FieldDiff{Field: k, Have: rec.Applied[k], Want: "<absent>", Sensitive: sensitive[k]})
 		}
 	}
 	return out

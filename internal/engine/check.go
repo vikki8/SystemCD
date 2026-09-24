@@ -45,12 +45,43 @@ func Check(repo *manifest.Repository) error {
 		if !declared[spec.Target] {
 			problems = append(problems, fmt.Sprintf("%s: patch targets %q, which no document in this repository declares", p.Location(), spec.Target))
 		}
+		// Edges a patch adds are dropped at plan time when they point outside
+		// the working set, so a typo here would silently lose the ordering.
+		for _, ref := range spec.DependsOn {
+			if !declared[ref] {
+				problems = append(problems, fmt.Sprintf("%s: dependsOn references unknown resource %q", p.Location(), ref))
+			}
+		}
+		for _, ref := range spec.Notify {
+			if !declared[ref] {
+				problems = append(problems, fmt.Sprintf("%s: notify references unknown resource %q", p.Location(), ref))
+			}
+		}
 	}
 	if len(problems) > 0 {
 		sort.Strings(problems)
 		return fmt.Errorf("invalid repository:\n  - %s", strings.Join(problems, "\n  - "))
 	}
 
-	_, err := build(resources)
+	// Targeting is ignored for everything else, but two resources claiming
+	// one path for hosts that can never overlap (role=web, role=db) plan fine
+	// on every host, so validate must not reject them.
+	_, err := buildFor(resources, labelsDisjoint)
 	return err
+}
+
+// labelsDisjoint reports whether two documents can never select the same
+// host: both require the same label with different values. Hostname globs
+// are not compared, so documents scoped only by them are assumed to overlap.
+func labelsDisjoint(a, b *manifest.Document) bool {
+	ta, tb := a.Metadata.Targets, b.Metadata.Targets
+	if ta == nil || tb == nil {
+		return false
+	}
+	for k, v := range ta.Labels {
+		if w, ok := tb.Labels[k]; ok && w != v {
+			return true
+		}
+	}
+	return false
 }
