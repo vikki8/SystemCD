@@ -105,8 +105,9 @@ type Snapshot struct {
 	Revision  string            `json:"revision,omitempty"`
 	UpdatedAt time.Time         `json:"updatedAt"`
 	Resources map[string]Record `json:"resources"`
-	// Changed is how many resources the last apply at Revision changed, kept
-	// so the history entry written when Revision moves on can say so.
+	// Changed is how many resources the applies at Revision changed in
+	// total, kept so the history entry written when Revision moves on can say
+	// so. Later no-op reconciles at the same revision add nothing to it.
 	Changed int `json:"changed,omitempty"`
 	// History holds the revisions applied before the current one, newest
 	// first, so `rollback` has somewhere to go.
@@ -321,6 +322,10 @@ func (snap *Snapshot) RecordApply(revision string, changed int) {
 		if len(snap.History) > maxHistory {
 			snap.History = snap.History[:maxHistory]
 		}
+	}
+	if revision == snap.Revision {
+		snap.Changed += changed
+		return
 	}
 	snap.Revision = revision
 	snap.Changed = changed

@@ -103,14 +103,19 @@ func TestHistoryCarriesEachRevisionsOwnChangeCount(t *testing.T) {
 	// much the apply that replaced it changed.
 	snap := emptySnapshot()
 	snap.RecordApply("rev1", 3)
+	// The agent keeps reconciling rev1; in-sync passes change nothing and
+	// must not wipe the count, while a healed drift adds to it.
+	snap.RecordApply("rev1", 0)
+	snap.RecordApply("rev1", 1)
+	snap.RecordApply("rev1", 0)
 	snap.UpdatedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	snap.RecordApply("rev2", 1)
 
 	if len(snap.History) != 1 {
 		t.Fatalf("history = %+v, want one entry for rev1", snap.History)
 	}
-	if got := snap.History[0]; got.Revision != "rev1" || got.Changed != 3 || got.AppliedAt.IsZero() {
-		t.Errorf("history[0] = %+v, want rev1 with 3 changes", got)
+	if got := snap.History[0]; got.Revision != "rev1" || got.Changed != 4 || got.AppliedAt.IsZero() {
+		t.Errorf("history[0] = %+v, want rev1 with 4 changes", got)
 	}
 }
 
