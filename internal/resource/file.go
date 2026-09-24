@@ -206,6 +206,11 @@ func (f *File) Observe(c *Context) (State, error) {
 		// Reporting it as its own state makes Apply replace the link.
 		return State{"state": stateSymlink, "_path": f.spec.Path, "_target": info.Target}, nil
 	}
+	if !info.Regular {
+		// Reading a FIFO blocks until something writes to it, which would
+		// hang every plan; a socket or device is not a config file either.
+		return nil, errNotRegular(f.spec.Path)
+	}
 
 	s := State{"state": Present, "_path": f.spec.Path, "mode": modeString(info.Mode)}
 	data, err := c.Host.ReadFile(f.spec.Path)
@@ -221,6 +226,11 @@ func (f *File) Observe(c *Context) (State, error) {
 	}
 	s["_bytes"] = strconv.FormatInt(info.Size, 10)
 	return s, nil
+}
+
+// errNotRegular refuses a path that holds a FIFO, socket or device.
+func errNotRegular(path string) error {
+	return fmt.Errorf("%s exists but is not a regular file (a FIFO, socket or device); systemcd will not read or replace it", path)
 }
 
 // stateSymlink is what File reports when its path holds a symbolic link
@@ -519,6 +529,9 @@ func backupExisting(c *Context, path string) error {
 		// replacing or removing the link leaves untouched. Reading through it
 		// could also copy a device or another user's file into the backups.
 		return nil
+	}
+	if !info.Regular {
+		return errNotRegular(path)
 	}
 	data, err := c.Host.ReadFile(path)
 	if errors.Is(err, host.ErrNotExist) {

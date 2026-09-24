@@ -69,6 +69,9 @@ func (f *File) CaptureBaseline(c *Context) ([]byte, error) {
 		// those bytes back with the link's 0777 mode.
 		return []byte(info.Target), nil
 	}
+	if !info.Regular {
+		return nil, errNotRegular(f.spec.Path)
+	}
 	data, err := c.Host.ReadFile(f.spec.Path)
 	if errors.Is(err, host.ErrNotExist) {
 		return nil, nil
@@ -301,7 +304,9 @@ func (f *File) ContentDiff(c *Context) (string, string, bool, error) {
 	}
 	// Never read through a symlink: its "before" is someone else's file, and
 	// printing it in a plan would leak whatever the link was pointed at.
-	if info, err := c.Host.Stat(f.spec.Path); err == nil && info.Target != "" {
+	if info, err := c.Host.Stat(f.spec.Path); err == nil && !info.Regular {
+		// Nor through anything else that is not a regular file: reading a
+		// FIFO would block the plan.
 		return "", "", false, nil
 	}
 	before, err := c.Host.ReadFile(f.spec.Path)

@@ -1,7 +1,11 @@
 package resource
 
 import (
+	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/vikki8/systemcd/internal/host"
 )
@@ -82,4 +86,51 @@ spec:
 		t.Errorf("contents = %q, want the file emptied", data)
 	}
 	assertConverged(t, r, c)
+}
+
+func TestFileRefusesAFIFOInsteadOfBlocking(t *testing.T) {
+	// Reading a FIFO blocks until a writer appears, so a FIFO at a managed
+	// path used to hang plan forever. It must be refused, promptly.
+	h, root := rootedHost(t)
+	if err := syscall.Mkfifo(filepath.Join(root, "etc", "app.conf"), 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	c := newContext(h)
+	r := buildFrom(t, `
+apiVersion: systemcd.dev/v1
+kind: File
+metadata:
+  name: app
+spec:
+  path: /etc/app.conf
+  content: "x\n"
+`)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Observe(c)
+		if err == nil {
+			_, err = r.(Baseliner).CaptureBaseline(c)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("err = %v, want a refusal naming a non-regular file", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("observing a FIFO blocked")
+	}
+
+	pruned := make(chan error, 1)
+	go func() { pruned <- r.(Deletable).Delete(c) }()
+	select {
+	case err := <-pruned:
+		if err == nil {
+			t.Error("prune removed a FIFO the File never managed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pruning past a FIFO blocked in the backup")
+	}
 }
