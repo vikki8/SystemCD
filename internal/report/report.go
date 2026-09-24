@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vikki8/systemcd/internal/engine"
 	"github.com/vikki8/systemcd/internal/resource"
@@ -357,6 +358,27 @@ func diffFields(d resource.Diff) []string {
 	return out
 }
 
+// StillOutOfSync reports whether a resource still differs from the
+// repository once the reconcile has finished. A plan (or a paused or
+// report-only agent pass) changed nothing, so whatever it found still
+// stands; an apply converged everything except what failed.
+func StillOutOfSync(r *engine.Report, res engine.Result) bool {
+	if r.DryRun {
+		return res.OutOfSync()
+	}
+	return res.Err != nil
+}
+
+// hostOutOfSync reports whether anything still differs after the run.
+func hostOutOfSync(r *engine.Report) bool {
+	for _, res := range r.Results {
+		if StillOutOfSync(r, res) {
+			return true
+		}
+	}
+	return false
+}
+
 // jsonResult is the stable machine-readable shape.
 type jsonResult struct {
 	Resource string          `json:"resource"`
@@ -416,13 +438,18 @@ func nonZero(t time.Time) *time.Time {
 // scraping into monitoring.
 func JSON(w io.Writer, r *engine.Report) error {
 	out := jsonReport{
-		Revision:   r.Revision,
-		DryRun:     r.DryRun,
-		OutOfSync:  r.OutOfSync(),
+		Revision: r.Revision,
+		DryRun:   r.DryRun,
+		// After an apply this is whether the host still differs, which is
+		// what "status": "Synced" beside it already claims; a resource the
+		// apply just converged is no longer out of sync.
+		OutOfSync:  hostOutOfSync(r),
 		Counts:     r.Counts(),
 		Operation:  r.Operation,
 		DurationMS: r.Finished.Sub(r.Started).Milliseconds(),
 		Notes:      r.Notes,
+		// An empty run is an empty list, not null, so `.results[]` works.
+		Results: []jsonResult{},
 	}
 	status, _ := syncStatus(palette{}, r)
 	out.Status = status
@@ -439,7 +466,7 @@ func JSON(w io.Writer, r *engine.Report) error {
 			Messages: res.Messages,
 			Source:   res.Source,
 		}
-		if res.OutOfSync() {
+		if StillOutOfSync(r, res) {
 			jr.Sync = "OutOfSync"
 		}
 		if res.Action == engine.ActionOrphan {
@@ -478,10 +505,12 @@ func truncate(s string) string { return truncateTo(s, 72) }
 
 func truncateTo(s string, max int) string {
 	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
-	if len(s) <= max {
+	if utf8.RuneCountInString(s) <= max {
 		return s
 	}
-	return s[:max-1] + "…"
+	// Cut on a character boundary: slicing bytes can split a multi-byte
+	// character and print invalid UTF-8.
+	return string([]rune(s)[:max-1]) + "…"
 }
 
 func shortRev(rev string) string {

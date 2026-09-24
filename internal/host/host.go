@@ -23,6 +23,11 @@ var ErrUnknownUser = errors.New("unknown user or group")
 // ErrLocked is returned by TryLock when another process holds the lock.
 var ErrLocked = errors.New("lock held by another process")
 
+// ErrSymlink is returned by Chmod for a path that is a symbolic link. Linux
+// cannot change a link's own mode, and following it would change whatever it
+// points at instead.
+var ErrSymlink = errors.New("refusing to change the mode of a symlink, which would change its target instead")
+
 // Result captures the outcome of a command execution.
 type Result struct {
 	Stdout   string
@@ -42,6 +47,10 @@ type FileInfo struct {
 	GID   int
 	Size  int64
 	IsDir bool
+	// Regular is true for a regular file, and false for directories,
+	// symlinks, FIFOs, sockets and devices. Reading a FIFO blocks until a
+	// writer appears, so check this before ReadFile on an untrusted path.
+	Regular bool
 	// Target is the link destination when the path is a symlink.
 	Target string
 }
