@@ -13,7 +13,10 @@ import (
 func init() { Register("Sysctl", buildSysctl) }
 
 // sysctlDropInDir is where persisted values are written so they survive a
-// reboot. A high prefix keeps systemcd's values winning over distro defaults.
+// reboot. The 60- prefix sorts after distro defaults (10-, 50-), so systemcd's
+// values win over those at boot. It still sorts before 99-sysctl.conf, the
+// admin's /etc/sysctl.conf, which wins at boot until the next reconcile puts
+// the runtime value back.
 const sysctlDropInDir = "/etc/sysctl.d"
 
 // SysctlSpec declares kernel parameters.
