@@ -101,7 +101,17 @@ func (d *Document) DecodeSpec(out any) error {
 	if d.Spec.IsZero() {
 		return nil
 	}
-	raw, err := yaml.Marshal(&d.Spec)
+	spec := &d.Spec
+	if hasAlias(spec) {
+		// Encoded on its own, an alias whose anchor lives outside the spec
+		// (`name: &n nginx` in metadata, `*n` in spec) no longer resolves.
+		expanded, err := expandAliases(spec, new(int))
+		if err != nil {
+			return fmt.Errorf("%s: spec: %w", d.Location(), err)
+		}
+		spec = expanded
+	}
+	raw, err := yaml.Marshal(spec)
 	if err != nil {
 		return fmt.Errorf("%s: spec: %w", d.Location(), err)
 	}
@@ -111,6 +121,49 @@ func (d *Document) DecodeSpec(out any) error {
 		return fmt.Errorf("%s: spec: %w", d.Location(), err)
 	}
 	return nil
+}
+
+// maxAliasExpansion bounds how many nodes expanding a spec's aliases may
+// produce, so a pathological chain of aliases fails instead of exhausting
+// memory.
+const maxAliasExpansion = 100_000
+
+func hasAlias(n *yaml.Node) bool {
+	if n == nil {
+		return false
+	}
+	if n.Kind == yaml.AliasNode {
+		return true
+	}
+	for _, c := range n.Content {
+		if hasAlias(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// expandAliases returns a copy of n in which every alias is replaced by a copy
+// of the node it refers to, and no anchors remain.
+func expandAliases(n *yaml.Node, count *int) (*yaml.Node, error) {
+	for n.Kind == yaml.AliasNode && n.Alias != nil {
+		n = n.Alias
+	}
+	*count++
+	if *count > maxAliasExpansion {
+		return nil, errors.New("aliases expand to too many nodes")
+	}
+	dup := *n
+	dup.Anchor = ""
+	dup.Content = nil
+	for _, c := range n.Content {
+		e, err := expandAliases(c, count)
+		if err != nil {
+			return nil, err
+		}
+		dup.Content = append(dup.Content, e)
+	}
+	return &dup, nil
 }
 
 // Config holds repository-level settings, supplied by a Config document and
@@ -154,20 +207,31 @@ type Repository struct {
 func (r *Repository) SelectFor(n Node) []*Document {
 	docs, err := r.SelectForE(n)
 	if err != nil {
-		return nil
+		return r.targeted(n)
 	}
 	return docs
 }
 
 // SelectForE is SelectFor with the patch error surfaced.
 func (r *Repository) SelectForE(n Node) ([]*Document, error) {
+	declared := map[string]bool{}
+	for _, d := range r.Documents {
+		if d.Kind != PatchKind {
+			declared[d.Ref()] = true
+		}
+	}
+	return applyPatches(r.targeted(n), n, declared)
+}
+
+// targeted returns the documents, patches included, that select n.
+func (r *Repository) targeted(n Node) []*Document {
 	var out []*Document
 	for _, d := range r.Documents {
 		if d.Metadata.Targets.Matches(n) {
 			out = append(out, d)
 		}
 	}
-	return ApplyPatches(out, n)
+	return out
 }
 
 // Validate checks structural invariants that hold regardless of kind:
@@ -175,13 +239,9 @@ func (r *Repository) SelectForE(n Node) ([]*Document, error) {
 func (r *Repository) Validate() error {
 	var problems []string
 	seen := map[string]*Document{}
+	patches := map[string]*Document{}
 
 	for _, d := range r.Documents {
-		if d.Kind == PatchKind {
-			// A patch's target is resolved per node, since a patch and the
-			// resource it narrows can be scoped differently.
-			continue
-		}
 		if d.APIVersion != APIVersion {
 			problems = append(problems, fmt.Sprintf("%s: apiVersion %q is not supported (want %q)", d.Location(), d.APIVersion, APIVersion))
 		}
@@ -193,24 +253,36 @@ func (r *Repository) Validate() error {
 			problems = append(problems, fmt.Sprintf("%s: metadata.name is required", d.Location()))
 			continue
 		}
-		if prev, dup := seen[d.Ref()]; dup {
+		if d.Metadata.Targets != nil {
+			for _, pattern := range d.Metadata.Targets.Hosts {
+				// A malformed glob matches no hostname at all, which would
+				// quietly drop the document from every host.
+				if _, err := filepath.Match(pattern, ""); err != nil {
+					problems = append(problems, fmt.Sprintf("%s: metadata.targets.hosts: %q is not a valid glob: %v", d.Location(), pattern, err))
+				}
+			}
+		}
+		// A patch's target is resolved per node, since a patch and the
+		// resource it narrows can be scoped differently; patches are kept
+		// apart so nothing can depend on one.
+		declared := seen
+		if d.Kind == PatchKind {
+			declared = patches
+		}
+		if prev, dup := declared[d.Ref()]; dup {
 			problems = append(problems, fmt.Sprintf("%s: duplicate resource %s, already declared at %s", d.Location(), d.Ref(), prev.Location()))
 			continue
 		}
-		seen[d.Ref()] = d
+		declared[d.Ref()] = d
 	}
 
 	for _, d := range r.Documents {
-		for _, ref := range d.DependsOn {
-			if _, ok := seen[ref]; !ok {
-				problems = append(problems, fmt.Sprintf("%s: dependsOn references unknown resource %q", d.Location(), ref))
-			}
+		if d.Kind == PatchKind {
+			problems = append(problems, validatePatch(d, seen)...)
+			continue
 		}
-		for _, ref := range d.Notify {
-			if _, ok := seen[ref]; !ok {
-				problems = append(problems, fmt.Sprintf("%s: notify references unknown resource %q", d.Location(), ref))
-			}
-		}
+		problems = append(problems, unknownRefs(d, "dependsOn", d.DependsOn, seen)...)
+		problems = append(problems, unknownRefs(d, "notify", d.Notify, seen)...)
 	}
 
 	if len(problems) == 0 {
@@ -218,4 +290,42 @@ func (r *Repository) Validate() error {
 	}
 	sort.Strings(problems)
 	return fmt.Errorf("invalid repository:\n  - %s", strings.Join(problems, "\n  - "))
+}
+
+func unknownRefs(d *Document, field string, refs []string, declared map[string]*Document) []string {
+	var problems []string
+	for _, ref := range refs {
+		if _, ok := declared[ref]; !ok {
+			problems = append(problems, fmt.Sprintf("%s: %s references unknown resource %q", d.Location(), field, ref))
+		}
+	}
+	return problems
+}
+
+// validatePatch checks what a patch can be checked for without a node: that
+// its target and the edges it appends exist somewhere in the repository.
+// Those edges are otherwise dropped silently at reconcile time, where a
+// reference outside the working set is indistinguishable from host targeting.
+func validatePatch(d *Document, declared map[string]*Document) []string {
+	var problems []string
+	if len(d.DependsOn) > 0 || len(d.Notify) > 0 {
+		problems = append(problems, fmt.Sprintf(
+			"%s: dependsOn and notify on a Patch document itself are ignored; put them under spec to append them to the target", d.Location()))
+	}
+	var spec PatchSpec
+	if err := d.DecodeSpec(&spec); err != nil {
+		return append(problems, err.Error())
+	}
+	if spec.Target == "" {
+		return append(problems, fmt.Sprintf("%s: spec.target is required", d.Location()))
+	}
+	if err := checkPatchNode(&spec.Patch); err != nil {
+		problems = append(problems, fmt.Sprintf("%s: %v", d.Location(), err))
+	}
+	if _, ok := declared[spec.Target]; !ok {
+		problems = append(problems, fmt.Sprintf("%s: patch targets %q, which no document in this repository declares", d.Location(), spec.Target))
+	}
+	problems = append(problems, unknownRefs(d, "spec.dependsOn", spec.DependsOn, declared)...)
+	problems = append(problems, unknownRefs(d, "spec.notify", spec.Notify, declared)...)
+	return problems
 }

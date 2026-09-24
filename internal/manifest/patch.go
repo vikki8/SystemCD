@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -58,6 +59,15 @@ type PatchMetadata struct {
 // Patches are applied in load order, so a later layer wins — the same rule
 // Kustomize uses, and the one people expect from "base, then role, then host".
 func ApplyPatches(docs []*Document, node Node) ([]*Document, error) {
+	return applyPatches(docs, node, nil)
+}
+
+// applyPatches is ApplyPatches with knowledge of every resource the repository
+// declares. A patch whose target exists but is not selected for this node has
+// nothing to narrow here and is skipped: a patch scoped more widely than its
+// target (env=prod over a role=web resource) must not break every other host
+// it matches.
+func applyPatches(docs []*Document, node Node, declared map[string]bool) ([]*Document, error) {
 	var patches []*Document
 	var out []*Document
 	index := map[string]int{}
@@ -115,6 +125,9 @@ func ApplyPatches(docs []*Document, node Node) ([]*Document, error) {
 			continue
 		}
 		target, ok := claim(spec.Target)
+		if !ok && declared[spec.Target] {
+			continue
+		}
 		if !ok {
 			problems = append(problems, fmt.Sprintf(
 				"%s: patch targets %q, which is not declared for this host. "+
@@ -135,7 +148,10 @@ func ApplyPatches(docs []*Document, node Node) ([]*Document, error) {
 }
 
 func mergeInto(target *Document, spec PatchSpec) error {
-	if !spec.Patch.IsZero() {
+	if err := checkPatchNode(&spec.Patch); err != nil {
+		return err
+	}
+	if patch := resolveAlias(unwrapDocument(&spec.Patch)); patch.Kind == yaml.MappingNode {
 		merged, err := mergeNodes(&target.Spec, &spec.Patch)
 		if err != nil {
 			return err
@@ -162,8 +178,8 @@ func mergeInto(target *Document, spec PatchSpec) error {
 // universal merge for an unkeyed list, and quietly appending would make
 // `groups: [docker]` mean something different in a patch than in a base.
 func mergeNodes(base, patch *yaml.Node) (*yaml.Node, error) {
-	base = unwrapDocument(base)
-	patch = unwrapDocument(patch)
+	base = resolveAlias(unwrapDocument(base))
+	patch = resolveAlias(unwrapDocument(patch))
 
 	if base == nil || base.Kind == 0 {
 		return patch, nil
@@ -179,7 +195,7 @@ func mergeNodes(base, patch *yaml.Node) (*yaml.Node, error) {
 	merged.Content = append([]*yaml.Node(nil), base.Content...)
 
 	for i := 0; i+1 < len(patch.Content); i += 2 {
-		key, value := patch.Content[i], patch.Content[i+1]
+		key, value := patch.Content[i], resolveAlias(patch.Content[i+1])
 		replaced := false
 		for j := 0; j+1 < len(merged.Content); j += 2 {
 			if merged.Content[j].Value != key.Value {
@@ -211,6 +227,27 @@ func unwrapDocument(n *yaml.Node) *yaml.Node {
 		return n.Content[0]
 	}
 	return n
+}
+
+// resolveAlias follows an alias to the node it names, so `mode: *strict`
+// merges and nulls exactly like the value it stands for.
+func resolveAlias(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode && n.Alias != nil {
+		n = n.Alias
+	}
+	return n
+}
+
+// checkPatchNode rejects a spec.patch that is not a mapping. An empty or null
+// `patch:` (every field commented out, say) merges nothing; it must not
+// replace the target's whole spec, which would silently reset a Service
+// declared `state: stopped` back to the default of started.
+func checkPatchNode(patch *yaml.Node) error {
+	n := resolveAlias(unwrapDocument(patch))
+	if n == nil || n.Kind == 0 || n.Kind == yaml.MappingNode || n.Tag == "!!null" {
+		return nil
+	}
+	return errors.New("spec.patch must be a mapping of fields to merge over the target's spec")
 }
 
 func appendUnique(existing, extra []string) []string {
