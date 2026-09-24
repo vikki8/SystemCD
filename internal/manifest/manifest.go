@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -253,6 +254,10 @@ func (r *Repository) Validate() error {
 			problems = append(problems, fmt.Sprintf("%s: metadata.name is required", d.Location()))
 			continue
 		}
+		if err := checkName(d.Metadata.Name); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: metadata.name %q %v", d.Location(), d.Metadata.Name, err))
+			continue
+		}
 		if d.Metadata.Targets != nil {
 			for _, pattern := range d.Metadata.Targets.Hosts {
 				// A malformed glob matches no hostname at all, which would
@@ -290,6 +295,22 @@ func (r *Repository) Validate() error {
 	}
 	sort.Strings(problems)
 	return fmt.Errorf("invalid repository:\n  - %s", strings.Join(problems, "\n  - "))
+}
+
+// checkName rejects names that cannot serve as one path component. A name
+// ends up in "Kind/name" references and in file names (a Sysctl's drop-in is
+// 60-systemcd-<name>.conf), so "../../tmp/x" would write outside the
+// directory it belongs in.
+func checkName(name string) error {
+	if strings.Contains(name, "/") || strings.Contains(name, "..") {
+		return errors.New(`must not contain "/" or ".."`)
+	}
+	for _, r := range name {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errors.New("must not contain whitespace or control characters")
+		}
+	}
+	return nil
 }
 
 func unknownRefs(d *Document, field string, refs []string, declared map[string]*Document) []string {

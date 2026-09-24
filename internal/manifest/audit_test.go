@@ -3,6 +3,7 @@ package manifest
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -327,6 +328,29 @@ func TestValidateChecksPatchDocuments(t *testing.T) {
 				t.Errorf("error = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateRejectsNamesThatAreNotOnePathComponent(t *testing.T) {
+	// A name becomes part of file names (a Sysctl's drop-in is
+	// 60-systemcd-<name>.conf), so it must not be able to walk out of the
+	// directory it belongs in.
+	for _, name := range []string{"../../../tmp/evil", "a/b", "a..b", "has space", "tab\there", "nl\nhere"} {
+		src := "apiVersion: systemcd.dev/v1\nkind: Sysctl\nmetadata:\n  name: " + strconv.Quote(name) + "\nspec:\n  key: vm.swappiness\n  value: \"10\"\n"
+		docs, err := Parse([]byte(src), "t.yaml")
+		if err != nil {
+			t.Fatalf("%q: Parse: %v", name, err)
+		}
+		if err := (&Repository{Documents: docs}).Validate(); err == nil || !strings.Contains(err.Error(), "metadata.name") {
+			t.Errorf("%q: Validate error = %v, want the name rejected", name, err)
+		}
+	}
+	docs, err := Parse([]byte("apiVersion: systemcd.dev/v1\nkind: File\nmetadata:\n  name: nginx.conf_v2-web01\nspec:\n  path: /etc/x\n"), "t.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Repository{Documents: docs}).Validate(); err != nil {
+		t.Errorf("an ordinary name was rejected: %v", err)
 	}
 }
 
