@@ -57,16 +57,39 @@ func (s *Sysctl) Validate() error {
 		s.values[s.spec.Key] = s.spec.Value
 	}
 	for k, v := range s.spec.Values {
+		if prev, dup := s.values[k]; dup && prev != v {
+			return fmt.Errorf("sysctl key %q is set to both %q (spec.value) and %q (spec.values)", k, prev, v)
+		}
 		s.values[k] = v
 	}
 	if len(s.values) == 0 {
 		return errors.New("spec.key/spec.value or spec.values is required")
 	}
-	for k := range s.values {
-		if strings.ContainsAny(k, " \t\n=") {
+	for k, v := range s.values {
+		if k == "" {
+			return errors.New("sysctl key is empty")
+		}
+		if strings.ContainsAny(k, " \t\r\n=") {
 			return fmt.Errorf("sysctl key %q contains whitespace or '='", k)
 		}
+		// The key is an argument to `sysctl -n` during plan; "-p" or
+		// "--system" would load and apply every sysctl.d file instead.
+		if strings.HasPrefix(k, "-") {
+			return fmt.Errorf("sysctl key %q starts with '-', which sysctl would read as an option", k)
+		}
+		if strings.TrimSpace(v) == "" {
+			return fmt.Errorf("sysctl key %q has an empty value", k)
+		}
+		// One line per key in the drop-in: a newline in a value would
+		// persist whatever follows it as another setting.
+		if strings.ContainsAny(strings.TrimRight(v, "\n"), "\r\n") {
+			return fmt.Errorf("sysctl value for %q spans more than one line", k)
+		}
 		s.keys = append(s.keys, k)
+	}
+	// The drop-in's file name is built from the resource name.
+	if s.persist() && strings.Contains(s.name, "/") {
+		return fmt.Errorf("metadata.name %q contains '/', which would place the drop-in outside %s", s.name, sysctlDropInDir)
 	}
 	normalizeSorted(s.keys)
 	return nil
