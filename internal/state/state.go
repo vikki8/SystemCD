@@ -142,6 +142,10 @@ func (s *Store) warn(format string, args ...any) {
 // does not cost the operator every ownership record on the machine.
 func (s *Store) backupPath() string { return s.Path + ".bak" }
 
+// corruptPath holds a state file that could not be parsed, set aside rather
+// than overwritten, since it may still be recoverable by hand.
+func (s *Store) corruptPath() string { return s.Path + ".corrupt" }
+
 // Load reads the snapshot, returning an empty one when no state exists yet.
 //
 // A corrupt state file falls back to the previous good copy rather than
@@ -194,24 +198,45 @@ func (s *Store) load(path string) (*Snapshot, error) {
 	if snap.Resources == nil {
 		snap.Resources = map[string]Record{}
 	}
-	migrate(&snap)
+	migrate(&snap, data)
 	return &snap, nil
 }
 
-// migrate brings an older snapshot up to the current schema.
-func migrate(snap *Snapshot) {
+// migrate brings an older snapshot, parsed from data, up to the current
+// schema.
+func migrate(snap *Snapshot, data []byte) {
 	if snap.Version >= Version {
 		return
 	}
-	// v1 had no ownership timestamps. Backfilling them from the file's own
-	// UpdatedAt is the most honest guess available: it is when the record was
-	// last written, and marking these as adopted would be a fabrication.
+	// v1 kept the state it had applied under "desired" and when under
+	// "appliedAt". The first is exactly what drift attribution compares the
+	// host against, and the second is the real last-applied time, so both
+	// carry over. The bytes already parsed as a Snapshot; if this shape does
+	// not fit them, the fields simply stay empty and fall back below.
+	var v1 struct {
+		Resources map[string]struct {
+			Desired   map[string]string `json:"desired"`
+			AppliedAt time.Time         `json:"appliedAt"`
+		} `json:"resources"`
+	}
+	_ = json.Unmarshal(data, &v1)
+
+	// v1 had no first-applied time or adoption flag. The earliest time the
+	// record proves it was applied is the most honest guess available, and
+	// marking these as adopted would be a fabrication.
 	for ref, rec := range snap.Resources {
+		old := v1.Resources[ref]
+		if len(rec.Applied) == 0 {
+			rec.Applied = old.Desired
+		}
+		if rec.LastAppliedAt.IsZero() {
+			rec.LastAppliedAt = old.AppliedAt
+		}
 		if rec.LastAppliedAt.IsZero() {
 			rec.LastAppliedAt = snap.UpdatedAt
 		}
 		if rec.FirstAppliedAt.IsZero() {
-			rec.FirstAppliedAt = snap.UpdatedAt
+			rec.FirstAppliedAt = rec.LastAppliedAt
 		}
 		snap.Resources[ref] = rec
 	}
@@ -237,8 +262,20 @@ func (s *Store) Save(snap *Snapshot) error {
 	// Rotate before overwriting so a crash mid-write leaves a recoverable
 	// copy behind.
 	if prev, err := s.Host.ReadFile(s.Path); err == nil {
-		if err := s.Host.WriteFile(s.backupPath(), prev, 0o600); err != nil {
-			s.warn("could not rotate state backup: %v", err)
+		var probe Snapshot
+		if json.Unmarshal(prev, &probe) == nil {
+			if err := s.Host.WriteFile(s.backupPath(), prev, 0o600); err != nil {
+				s.warn("could not rotate state backup: %v", err)
+			}
+		} else {
+			// A torn file is not a backup. Rotating it over the good copy
+			// Load recovered from would leave nothing usable if this write
+			// fails too, so keep it aside for inspection instead.
+			if err := s.Host.WriteFile(s.corruptPath(), prev, 0o600); err != nil {
+				s.warn("could not keep a copy of the corrupt state file at %s: %v", s.corruptPath(), err)
+			} else {
+				s.warn("kept a copy of the corrupt state file at %s", s.corruptPath())
+			}
 		}
 	} else if !errors.Is(err, host.ErrNotExist) {
 		s.warn("could not read state for rotation: %v", err)
