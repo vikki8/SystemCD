@@ -23,6 +23,11 @@ var ErrUnknownUser = errors.New("unknown user or group")
 // ErrLocked is returned by TryLock when another process holds the lock.
 var ErrLocked = errors.New("lock held by another process")
 
+// ErrSymlink is returned by Chmod for a path that is a symbolic link. Linux
+// cannot change a link's own mode, and following it would change whatever it
+// points at instead.
+var ErrSymlink = errors.New("refusing to change the mode of a symlink, which would change its target instead")
+
 // Result captures the outcome of a command execution.
 type Result struct {
 	Stdout   string

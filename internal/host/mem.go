@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // memFile is one entry in MemHost's filesystem.
@@ -91,8 +92,43 @@ func (m *MemHost) AddStub(s CommandStub) { m.Stubs = append(m.Stubs, s) }
 func (m *MemHost) SetFile(p, content string, mode fs.FileMode, uid, gid int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.mkdirAllLocked(path.Dir(clean(p)), 0o755)
+	_ = m.mkdirAllLocked(path.Dir(clean(p)), 0o755)
 	m.files[clean(p)] = &memFile{data: []byte(content), mode: mode, uid: uid, gid: gid}
+}
+
+// isSymlink reports whether an entry is a symbolic link.
+func (f *memFile) isSymlink() bool { return f.target != "" }
+
+// followLocked resolves symlinks at p the way open(2) does, returning the
+// final path and entry. Only the last component is followed, which is all
+// MemHost ever creates links at.
+func (m *MemHost) followLocked(p string) (string, *memFile, bool) {
+	cp := clean(p)
+	for hops := 0; hops < 40; hops++ {
+		f, ok := m.files[cp]
+		if !ok {
+			return cp, nil, false
+		}
+		if !f.isSymlink() {
+			return cp, f, true
+		}
+		if strings.HasPrefix(f.target, "/") {
+			cp = clean(f.target)
+		} else {
+			cp = clean(path.Join(path.Dir(cp), f.target))
+		}
+	}
+	return cp, nil, false
+}
+
+// hasChildrenLocked reports whether a directory has any entries.
+func (m *MemHost) hasChildrenLocked(dir string) bool {
+	for q := range m.files {
+		if q != dir && path.Dir(q) == dir {
+			return true
+		}
+	}
+	return false
 }
 
 // Paths returns every path present, sorted. Useful for test assertions.
@@ -120,6 +156,11 @@ func (m *MemHost) Ran(sub string) bool {
 }
 
 func (m *MemHost) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	// Like exec.CommandContext, a command is not started at all once its
+	// context is done.
+	if err := ctx.Err(); err != nil {
+		return Result{ExitCode: -1}, fmt.Errorf("%s: %w", name, err)
+	}
 	line := strings.TrimSpace(name + " " + strings.Join(args, " "))
 
 	m.mu.Lock()
@@ -160,9 +201,14 @@ func (m *MemHost) LookPath(name string) (string, error) {
 func (m *MemHost) ReadFile(p string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	f, ok := m.files[clean(p)]
-	if !ok || f.isDir {
+	// os.ReadFile follows a symlink to its target, and reading a directory
+	// is an error rather than "absent".
+	_, f, ok := m.followLocked(p)
+	if !ok {
 		return nil, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
+	}
+	if f.isDir {
+		return nil, &fs.PathError{Op: "read", Path: p, Err: syscall.EISDIR}
 	}
 	out := make([]byte, len(f.data))
 	copy(out, f.data)
@@ -199,16 +245,23 @@ func (m *MemHost) WriteFile(p string, data []byte, mode fs.FileMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := clean(p)
-	m.mkdirAllLocked(path.Dir(cp), 0o755)
+	if err := m.mkdirAllLocked(path.Dir(cp), 0o755); err != nil {
+		return err
+	}
 	buf := make([]byte, len(data))
 	copy(buf, data)
-	if existing, ok := m.files[cp]; ok && !existing.isDir {
-		// Preserve ownership across a content rewrite, matching rename-based
-		// atomic writes followed by an explicit chown.
+	existing, ok := m.files[cp]
+	switch {
+	case ok && existing.isDir:
+		// rename(2) cannot put a file where a directory is.
+		return &fs.PathError{Op: "write", Path: p, Err: syscall.EISDIR}
+	case ok && !existing.isSymlink():
+		// OSHost carries a regular file's ownership over to its replacement.
 		existing.data = buf
 		existing.mode = mode
 		return nil
 	}
+	// A new file, or a symlink that the rename replaces rather than follows.
 	m.files[cp] = &memFile{data: buf, mode: mode}
 	return nil
 }
@@ -221,12 +274,17 @@ func (m *MemHost) Stat(p string) (FileInfo, error) {
 	if !ok {
 		return FileInfo{}, &fs.PathError{Op: "stat", Path: p, Err: fs.ErrNotExist}
 	}
+	size := int64(len(f.data))
+	if f.isSymlink() {
+		// lstat(2) reports the length of the link text.
+		size = int64(len(f.target))
+	}
 	return FileInfo{
 		Path:   cp,
 		Mode:   f.mode.Perm(),
 		UID:    f.uid,
 		GID:    f.gid,
-		Size:   int64(len(f.data)),
+		Size:   size,
 		IsDir:  f.isDir,
 		Target: f.target,
 	}, nil
@@ -236,8 +294,12 @@ func (m *MemHost) ReadDir(p string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := clean(p)
-	if f, ok := m.files[cp]; !ok || !f.isDir {
+	f, ok := m.files[cp]
+	if !ok {
 		return nil, &fs.PathError{Op: "readdir", Path: p, Err: fs.ErrNotExist}
+	}
+	if !f.isDir {
+		return nil, &fs.PathError{Op: "readdir", Path: p, Err: syscall.ENOTDIR}
 	}
 	seen := map[string]bool{}
 	var out []string
@@ -255,31 +317,42 @@ func (m *MemHost) ReadDir(p string) ([]string, error) {
 	return out, nil
 }
 
-func (m *MemHost) mkdirAllLocked(p string, mode fs.FileMode) {
+func (m *MemHost) mkdirAllLocked(p string, mode fs.FileMode) error {
 	cp := clean(p)
 	if cp == "/" {
-		return
+		return nil
 	}
-	if f, ok := m.files[cp]; ok && f.isDir {
-		return
+	if f, ok := m.files[cp]; ok {
+		if f.isDir || f.isSymlink() {
+			return nil
+		}
+		// os.MkdirAll does not turn an existing file into a directory.
+		return &fs.PathError{Op: "mkdir", Path: cp, Err: syscall.ENOTDIR}
 	}
-	m.mkdirAllLocked(path.Dir(cp), mode)
+	if err := m.mkdirAllLocked(path.Dir(cp), mode); err != nil {
+		return err
+	}
 	m.files[cp] = &memFile{mode: mode, isDir: true}
+	return nil
 }
 
 func (m *MemHost) MkdirAll(p string, mode fs.FileMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.mkdirAllLocked(p, mode)
-	return nil
+	return m.mkdirAllLocked(p, mode)
 }
 
 func (m *MemHost) Remove(p string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := clean(p)
-	if _, ok := m.files[cp]; !ok {
+	f, ok := m.files[cp]
+	if !ok {
 		return &fs.PathError{Op: "remove", Path: p, Err: fs.ErrNotExist}
+	}
+	if f.isDir && m.hasChildrenLocked(cp) {
+		// os.Remove never takes a directory's contents with it.
+		return &fs.PathError{Op: "remove", Path: p, Err: syscall.ENOTEMPTY}
 	}
 	delete(m.files, cp)
 	return nil
@@ -301,7 +374,14 @@ func (m *MemHost) Symlink(target, link string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cl := clean(link)
-	m.mkdirAllLocked(path.Dir(cl), 0o755)
+	if err := m.mkdirAllLocked(path.Dir(cl), 0o755); err != nil {
+		return err
+	}
+	if f, ok := m.files[cl]; ok && f.isDir && m.hasChildrenLocked(cl) {
+		// OSHost removes what is there first, which fails for a non-empty
+		// directory, and symlink(2) then refuses to overwrite it.
+		return &fs.PathError{Op: "symlink", Path: link, Err: syscall.EEXIST}
+	}
 	m.files[cl] = &memFile{mode: 0o777, target: target}
 	return nil
 }
@@ -312,6 +392,9 @@ func (m *MemHost) Chmod(p string, mode fs.FileMode) error {
 	f, ok := m.files[clean(p)]
 	if !ok {
 		return &fs.PathError{Op: "chmod", Path: p, Err: fs.ErrNotExist}
+	}
+	if f.isSymlink() {
+		return &fs.PathError{Op: "chmod", Path: p, Err: ErrSymlink}
 	}
 	f.mode = mode
 	return nil
@@ -324,7 +407,13 @@ func (m *MemHost) Chown(p string, uid, gid int) error {
 	if !ok {
 		return &fs.PathError{Op: "chown", Path: p, Err: fs.ErrNotExist}
 	}
-	f.uid, f.gid = uid, gid
+	// As with lchown(2), -1 leaves that id unchanged.
+	if uid >= 0 {
+		f.uid = uid
+	}
+	if gid >= 0 {
+		f.gid = gid
+	}
 	return nil
 }
 
